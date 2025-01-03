@@ -1,37 +1,41 @@
 use anyhow::Result;
-use clap::{crate_version, Arg, Command};
+use clap::{crate_version, Parser};
 
 mod fuse;
 
-fn main() -> Result<()> {
-    let app = Command::new("cfs daemon")
-        .version(crate_version!())
-        .author("Cheng Pan")
-        .arg(Arg::new("MOUNT_POINT").required(true).index(2))
-        .arg(
-            Arg::new("auto_unmount")
-                .long("auto_unmount")
-                .help("Automatically unmount on process exit"),
-        )
-        .arg(
-            Arg::new("DIGEST")
-                .required(true)
-                .index(1)
-                .help("The digest of the root directory"),
-        )
-        .get_matches();
+/// Cli is a commnad line struct for the daemon
+#[derive(Parser)]
+#[command(name = "cfsd")]
+#[command(about = "cfs daemon", long_about = None)]
+#[command(author = "Cheng Pan", version = crate_version!())]
+struct Cli {
+    /// The mount point of the daemon
+    #[arg(required(true), help = "The mount point of the filesystem", index(2))]
+    mount_point: String,
 
-    let digest = app
-        .value_of("DIGEST")
-        .ok_or(anyhow::Error::msg("fail to parse DIGEST"))?;
-    let tokens: Vec<_> = digest.split("/").collect();
+    /// The digest of the root directory
+    #[arg(required(true), help = "The digest of the root directory")]
+    digest: String,
+
+    /// Automatically unmount on process exit
+    #[arg(short, long, help = "Automatically unmount on process exit")]
+    auto_unmount: bool,
+}
+
+#[derive(Debug)]
+struct Settings {
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let tokens: Vec<_> = cli.digest.split("/").collect();
     if tokens.len() != 2 {
         return Err(anyhow::Error::msg("malformed digest"));
     }
-
     let hash = tokens[0];
     let size = tokens[1].parse::<i64>().unwrap();
 
-    let mountpoint = app.value_of("MOUNT_POINT").unwrap();
-    fuse::run(mountpoint, hash, size).map_err(|e| e.into())
+    let mountpoint = cli.mount_point;
+    fuse::run(&mountpoint, hash, size).map_err(|e| e.into())
 }
+
