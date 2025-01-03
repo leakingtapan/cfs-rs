@@ -6,13 +6,21 @@ CFS stands for Content addressable filesystem. It is built to serve files from C
 * Data transfer from CI to GCS and to Hydra has been a common pattern. The redundant transfers not only incurs storage cost but also data transfer cost, not to mention in a across cloud environment. With a FUSE filesystem, it enables the possiblity to short cut the data tranfers, and eliminiate the extra storage cost by reading data directly from CI to Hydra or other compuate environment, eg. Kubernetes.
 * Filesystem enables on demand loading of the data that the aplication actually needs. Application only need to read the data when it needs it, instead of downloading the whole directory tree up front but only reads a small portons of it.
 
+# Setup
+To setup the binary, first configure the required environment variables:
+```sh
+export CAS_ENDPOINT=https://cas.example.com # replace with real CAS endoint
+export CA_CERT_PATH=/usr/local/share/ca-certificates/example.rsa.crt # replace with real CA certificate
+```
+the CA cerificate is required for now.
+
 # CFS Daemon
 CFS daemon is the implementation of FUSE api for CAS contents.
 
 ![Watch the demo](./docs/demo.gif)
 
-# casctl
-Along with the CFS daemon, there is a companinon tool that used to inspect CAS and debug the daemon.
+# fsx tool
+Along with the CFS daemon, there is a companinon `fsx` tool that used to inspect CAS and debug the daemon.
 
 ```sh
 > cargo run --bin casctl -- --help 
