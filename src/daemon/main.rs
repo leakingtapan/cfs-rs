@@ -36,6 +36,7 @@ fn main() -> Result<()> {
     let size = tokens[1].parse::<i64>().unwrap();
 
     let mountpoint = cli.mount_point;
+    println!("mounting the digest {} at {}", cli.digest, mountpoint);
     fuse::run(&mountpoint, hash, size).map_err(|e| e.into())
 }
 
