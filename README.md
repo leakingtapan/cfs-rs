@@ -23,13 +23,12 @@ CFS daemon is the implementation of FUSE api for CAS contents.
 Along with the CFS daemon, there is a companinon `fsx` tool that used to inspect CAS and debug the daemon.
 
 ```sh
-> cargo run --bin casctl -- --help 
-
-casctl
-A CAS CLI
+> cargo run --bin fsx -- --help
+fsx
+FSx client side utility
 
 USAGE:
-    casctl <SUBCOMMAND>
+    fsx <SUBCOMMAND>
 
 OPTIONS:
     -h, --help    Print help information
@@ -37,8 +36,9 @@ OPTIONS:
 SUBCOMMANDS:
     download    Download file or directory from CAS
     help        Print this message or the help of the given subcommand(s)
+    mount       Mount the source
     test
-    upload      Upload file or directory to CAS
+    upload      Push file or directory to CAS [aliases: push]
 ```
 
 ## Upload
