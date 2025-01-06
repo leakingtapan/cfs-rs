@@ -1,3 +1,4 @@
+use cfs::cas::configs::Configs;
 use libc::ENOSYS;
 use anyhow::Result;
 use cfs::cas;
@@ -146,8 +147,8 @@ struct Cfs {
 }
 
 impl Cfs {
-    fn new(hash: &str, size: i64) -> Result<Cfs> {
-        let cas_client = cas::blocking::CacheClient::new()?;
+    fn new(hash: &str, size: i64, configs: Configs) -> Result<Cfs> {
+        let cas_client = cas::blocking::CacheClient::new(configs)?;
 
         Ok(Cfs {
             cas_client: cas_client,
@@ -373,7 +374,7 @@ impl Filesystem for Cfs {
     }
 }
 
-pub fn run(mountpoint: &str, hash: &str, size: i64) -> Result<()> {
+pub fn run(mountpoint: &str, hash: &str, size: i64, configs: Configs) -> Result<()> {
     if !Path::new(mountpoint).is_dir() {
         let res = fs::create_dir(mountpoint);
         if res.is_err() {
@@ -382,7 +383,7 @@ pub fn run(mountpoint: &str, hash: &str, size: i64) -> Result<()> {
         }
     }
 
-    let fs = Cfs::new(hash, size)?;
+    let fs = Cfs::new(hash, size, configs)?;
     // TODO: why need to edit /etc/fuse.conf to enable user_allow_others to allow autoumount?
     let mountoptions = vec![MountOption::AutoUnmount];
     fuser::mount2(fs, &mountpoint, &mountoptions).map_err(|e| e.into())

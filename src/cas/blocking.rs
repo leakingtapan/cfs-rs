@@ -1,4 +1,5 @@
 use super::auth::AuthInterceptor;
+use super::configs::Configs;
 use crate::git::get_git_root;
 use crate::git::get_lfs_object_path;
 use crate::git::git_lfs_fetch;
@@ -428,7 +429,7 @@ pub struct CacheClient {
 }
 
 impl CacheClient {
-    pub fn new() -> Result<CacheClient> {
+    pub fn new(configs: Configs) -> Result<CacheClient> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
