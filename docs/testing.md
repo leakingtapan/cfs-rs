@@ -71,6 +71,45 @@ The local service uses plaintext HTTP, so `CA_CERT_PATH` is not required.
 Seeded data is held only in memory and is discarded when the process exits.
 Run `cargo run --bin cas -- --help` for all options.
 
+## Inspect CAS objects
+
+With `CAS_ENDPOINT`, `INSTANCE_NAME`, and `~/.rbe-auth-token` configured, use
+`cascli` to inspect blobs and REAPI directories:
+
+```sh
+# Write the exact blob bytes to stdout.
+cargo run --bin cascli -- cat HASH/SIZE
+
+# List one encoded Directory.
+cargo run --bin cascli -- ls HASH/SIZE
+
+# Recursively walk an encoded Directory tree.
+cargo run --bin cascli -- tree HASH/SIZE
+```
+
+`cat` does not add formatting or a trailing newline, so redirect it when
+inspecting binary data:
+
+```sh
+cargo run --bin cascli -- cat HASH/SIZE > /tmp/blob
+```
+
+`ls` and `tree` print tab-separated records:
+
+```text
+file       path/to/file       hash/size
+directory  path/to/directory  hash/size
+symlink    path/to/link       target
+```
+
+Backslashes, tabs, newlines, and carriage returns in paths or symlink targets
+are escaped as `\\`, `\t`, `\n`, and `\r`, respectively, so each object remains
+one tab-separated record.
+
+The `ls` and `tree` commands require the supplied digest to contain an encoded
+Bazel REAPI `Directory`. Missing blobs, malformed digests, and malformed
+directory objects return a non-zero exit status.
+
 ## E2E coverage
 
 `tests/e2e.rs` covers the currently supported cfs-rs workflows:
@@ -85,7 +124,8 @@ Run `cargo run --bin cas -- --help` for all options.
 - ByteStream downloads and cached reads;
 - directory decoding, paginated CAS tree traversal, and metadata preservation;
 - the `fsx upload`, `download`, `mount`, and `test` subcommands;
-- standalone `cas` startup, file seeding, client access, and shutdown; and
+- standalone `cas` startup, file seeding, client access, and shutdown;
+- `cascli` raw blob, directory listing, and recursive tree inspection; and
 - invalid daemon arguments without requiring a privileged FUSE mount.
 
 An actual FUSE mount requires Linux kernel support and privileges. CI compiles

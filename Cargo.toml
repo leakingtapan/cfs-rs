@@ -45,3 +45,7 @@ path = "src/fsx/main.rs"
 [[bin]]
 name = "cas"
 path = "src/cas/main.rs"
+
+[[bin]]
+name = "cascli"
+path = "src/cascli/main.rs"

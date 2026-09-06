@@ -41,6 +41,17 @@ fn run_fsx_at(home: &Path, endpoint: &str, instance_name: &str, args: &[&str]) -
     output
 }
 
+fn run_cascli(home: &Path, cas: &InMemoryCas, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_cascli"))
+        .args(args)
+        .env("HOME", home)
+        .env("CAS_ENDPOINT", cas.endpoint())
+        .env("INSTANCE_NAME", "e2e")
+        .env_remove("CA_CERT_PATH")
+        .output()
+        .expect("run cascli")
+}
+
 fn parse_digest(value: &str) -> ReapiDigest {
     let (hash, size) = value.trim().split_once('/').expect("digest separator");
     ReapiDigest {
@@ -329,6 +340,62 @@ fn all_supported_cas_workflows() {
         node_properties: None,
     };
     let seeded_directory_digest = cas.insert_directory(&seeded_directory);
+    let cat_output = run_cascli(temp.path(), &cas, &["cat", &seeded_digest]);
+    assert!(cat_output.status.success());
+    assert_eq!(cat_output.stdout, b"seeded by test harness");
+
+    let large_digest = format!("{}/{}", sha256(&large), large.len());
+    let large_cat_output = run_cascli(temp.path(), &cas, &["cat", &large_digest]);
+    assert!(large_cat_output.status.success());
+    assert_eq!(large_cat_output.stdout, large);
+
+    let seeded_directory_digest_string = format!(
+        "{}/{}",
+        seeded_directory_digest.hash, seeded_directory_digest.size_bytes
+    );
+    let ls_output = run_cascli(
+        temp.path(),
+        &cas,
+        &["ls", seeded_directory_digest_string.as_str()],
+    );
+    assert!(
+        ls_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ls_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(ls_output.stdout).unwrap(),
+        format!("file\tseeded.txt\t{}\n", seeded_digest)
+    );
+
+    let tree_output = run_cascli(
+        temp.path(),
+        &cas,
+        &[
+            "tree",
+            &format!("{}/{}", root_digest.hash, root_digest.size_bytes),
+        ],
+    );
+    assert!(
+        tree_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tree_output.stderr)
+    );
+    let tree_output = String::from_utf8(tree_output.stdout).unwrap();
+    assert!(tree_output.contains("directory\t.\t"));
+    assert!(tree_output.contains("directory\tnested\t"));
+    assert!(tree_output.contains("file\tnested/large.bin\t"));
+    assert!(tree_output.contains("symlink\thello-link\thello.txt"));
+
+    let malformed = run_cascli(temp.path(), &cas, &["cat", "invalid"]);
+    assert!(!malformed.status.success());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("HASH/SIZE"));
+
+    let missing = format!("{}/1", "0".repeat(64));
+    let missing = run_cascli(temp.path(), &cas, &["cat", &missing]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("NotFound"));
+
     let mut cache = CacheClient::new().unwrap();
     assert_eq!(
         cache

@@ -41,6 +41,19 @@ SUBCOMMANDS:
     upload      Push file or directory to CAS [aliases: push]
 ```
 
+## cascli
+
+Use `cascli` to inspect raw blobs and encoded REAPI directories:
+
+```sh
+cargo run --bin cascli -- cat HASH/SIZE
+cargo run --bin cascli -- ls HASH/SIZE
+cargo run --bin cascli -- tree HASH/SIZE
+```
+
+See the [testing guide](docs/testing.md#inspect-cas-objects) for configuration,
+output formats, and use with the in-memory `cas` server.
+
 ## Upload
 Use the `casctl upload` subcommand to upload a file or directory to CAS.
 

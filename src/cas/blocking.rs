@@ -14,7 +14,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -87,6 +87,12 @@ impl Client {
             &digest,
             path.to_path_buf(),
         ))
+    }
+
+    /// Streams a blob directly to the supplied writer without caching it.
+    pub fn read_blob_to<W: Write>(&mut self, hash: &str, size: i64, writer: &mut W) -> Result<()> {
+        self.rt
+            .block_on(bs_read_blob_to(&mut self.bs_client, hash, size, writer))
     }
 }
 
@@ -519,6 +525,25 @@ pub(crate) async fn bs_read_blob(client: &mut BsClient, hash: &str, size: i64) -
         }
     }
     Ok(content)
+}
+
+async fn bs_read_blob_to<W: Write>(
+    client: &mut BsClient,
+    hash: &str,
+    size: i64,
+    writer: &mut W,
+) -> Result<()> {
+    let resource_name = format!("{}/blobs/{}/{}", instance_name(), hash, size);
+    let request = ReadRequest {
+        resource_name,
+        read_offset: 0,
+        read_limit: 0,
+    };
+    let mut response = client.read(request).await?;
+    while let Some(message) = response.get_mut().message().await? {
+        writer.write_all(&message.data)?;
+    }
+    Ok(())
 }
 
 // resource_name includes digests this means the digest has to
