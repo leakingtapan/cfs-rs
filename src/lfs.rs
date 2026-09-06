@@ -41,6 +41,7 @@ impl LfsFile {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;

@@ -17,11 +17,11 @@ pub fn upload<P: AsRef<Path>>(path: P, out: Option<P>, dry_run: bool) -> Result<
     // need to create the receiver independent of the uploader (which uses sender)
     // to avoid cyclic dependency when joining the handle
     // Create the receiver regardless for now. Optimize later.
-    let (send, handle) = blocking::spawn_receiver();
-    let uploader: Box<dyn BlobUploader> = if dry_run {
-        Box::new(NoopBlobUploader {})
+    let (uploader, handle): (Box<dyn BlobUploader>, Option<_>) = if dry_run {
+        (Box::new(NoopBlobUploader {}), None)
     } else {
-        Box::new(CasBlobUploader::new(send)?)
+        let (send, handle) = blocking::spawn_receiver();
+        (Box::new(CasBlobUploader::new(send)?), Some(handle))
     };
 
     let path = path.as_ref();
@@ -35,12 +35,10 @@ pub fn upload<P: AsRef<Path>>(path: P, out: Option<P>, dry_run: bool) -> Result<
         Err(anyhow::Error::msg("unsupported file type"))
     }?;
 
-    let res = handle.join();
-    if res.is_err() {
-        return Err(anyhow::Error::msg(format!(
-            "failed to join handle {:?}",
-            res.unwrap_err()
-        )));
+    if let Some(handle) = handle {
+        handle
+            .join()
+            .map_err(|e| anyhow::Error::msg(format!("failed to join upload thread: {:?}", e)))??;
     }
 
     let digest_str = format!("{}/{}", digest.hash, digest.size_bytes);
@@ -84,12 +82,12 @@ pub trait BlobUploader {
 pub struct NoopBlobUploader {}
 
 impl BlobUploader for NoopBlobUploader {
-    fn upload_blob(&mut self, digest: &Digest, _: Vec<u8>) -> Result<()> {
+    fn upload_blob(&mut self, _digest: &Digest, _: Vec<u8>) -> Result<()> {
         //println!("skip upload blob {:?}", digest);
         Ok(())
     }
 
-    fn upload_file(&mut self, _: &Digest, path: &Path) -> Result<()> {
+    fn upload_file(&mut self, _: &Digest, _path: &Path) -> Result<()> {
         //println!("skip upload file {:?}", path);
         Ok(())
     }

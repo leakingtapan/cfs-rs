@@ -16,13 +16,12 @@ impl AuthInterceptor {
         let token_path = format!("{}/.rbe-auth-token", home_dir);
         let mut token = String::new();
         let mut file = File::open(&token_path).map_err(|e| {
-            anyhow::Error::msg(format!(
-                "failed to open auth token {}: {}",
-                token_path, e
-            ))
+            anyhow::Error::msg(format!("failed to open auth token {}: {}", token_path, e))
         })?;
         file.read_to_string(&mut token)?;
-        Ok(AuthInterceptor { token: token })
+        Ok(AuthInterceptor {
+            token: token.trim().to_string(),
+        })
     }
 }
 
@@ -31,9 +30,7 @@ impl Interceptor for AuthInterceptor {
         let bearer_token = format!("Bearer {}", self.token);
         let header_value = MetadataValue::from_str(&bearer_token)
             .map_err(|_e| Status::invalid_argument("auth token is invalid"))?;
-        request
-            .metadata_mut()
-            .insert("authorization", header_value.clone());
+        request.metadata_mut().insert("authorization", header_value);
         Ok(request)
     }
 }

@@ -1,4 +1,3 @@
-use walkdir::WalkDir;
 use anyhow::Result;
 use bytes::BytesMut;
 use futures::stream::{StreamExt, TryStreamExt};

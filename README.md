@@ -92,6 +92,18 @@ cargo build
 cargo build --release
 ```
 
+## Test
+
+Install `protoc`, then run the unit and end-to-end suites:
+
+```sh
+cargo test --lib --bins
+cargo test --test e2e
+```
+
+See the [testing guide](docs/testing.md) for prerequisites, coverage, CI
+behavior, and examples of populating the in-memory CAS harness.
+
 ## Run the daemon
 ```sh
 

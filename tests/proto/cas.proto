@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package build.bazel.remote.execution.v2;
+
+service ContentAddressableStorage {
+  rpc FindMissingBlobs(FindMissingBlobsRequest) returns (FindMissingBlobsResponse);
+  rpc BatchUpdateBlobs(BatchUpdateBlobsRequest) returns (BatchUpdateBlobsResponse);
+  rpc GetTree(GetTreeRequest) returns (stream GetTreeResponse);
+}
+
+message Digest {
+  string hash = 1;
+  int64 size_bytes = 2;
+}
+
+message FindMissingBlobsRequest {
+  string instance_name = 1;
+  repeated Digest blob_digests = 2;
+}
+
+message FindMissingBlobsResponse {
+  repeated Digest missing_blob_digests = 2;
+}
+
+message BatchUpdateBlobsRequest {
+  message Request {
+    Digest digest = 1;
+    bytes data = 2;
+    int32 compressor = 3;
+  }
+
+  string instance_name = 1;
+  repeated Request requests = 2;
+}
+
+message BatchUpdateBlobsResponse {}
+
+message GetTreeRequest {
+  string instance_name = 1;
+  Digest root_digest = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message FileNode {
+  string name = 1;
+  Digest digest = 2;
+  bool is_executable = 4;
+}
+
+message DirectoryNode {
+  string name = 1;
+  Digest digest = 2;
+}
+
+message SymlinkNode {
+  string name = 1;
+  string target = 2;
+}
+
+message Directory {
+  repeated FileNode files = 1;
+  repeated DirectoryNode directories = 2;
+  repeated SymlinkNode symlinks = 3;
+}
+
+message GetTreeResponse {
+  repeated Directory directories = 1;
+  string next_page_token = 2;
+}
