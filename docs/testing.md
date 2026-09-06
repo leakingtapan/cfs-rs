@@ -26,10 +26,11 @@ sudo apt-get install --yes protobuf-compiler
 
 ## Run the tests
 
-Run the same two suites used by CI:
+Run the same test targets used by CI:
 
 ```sh
 cargo test --locked --lib --bins
+cargo test --locked --test cas_cli_e2e
 cargo test --locked --test e2e
 ```
 
@@ -125,6 +126,7 @@ directory objects return a non-zero exit status.
 - directory decoding, paginated CAS tree traversal, and metadata preservation;
 - the `fsx upload`, `download`, `mount`, and `test` subcommands;
 - standalone `cas` startup, file seeding, client access, and shutdown;
+- dedicated `cas` and `cascli` process interoperability in `cas_cli_e2e`;
 - `cascli` raw blob, directory listing, and recursive tree inspection; and
 - invalid daemon arguments without requiring a privileged FUSE mount.
 
@@ -164,7 +166,8 @@ E2E suite catch client defects that a permissive fake would hide.
 for:
 
 1. unit and binary tests; and
-2. end-to-end tests.
+2. end-to-end tests, with explicit `cas_cli_e2e` interoperability coverage
+   before the broader cfs E2E target.
 
 Both jobs install `protoc` and use `--locked` so dependency resolution matches
 `Cargo.lock`.

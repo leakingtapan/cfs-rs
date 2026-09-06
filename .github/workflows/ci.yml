@@ -36,5 +36,7 @@ jobs:
           components: rustfmt
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
-      - name: Run end-to-end tests
+      - name: Test cas with cascli
+        run: cargo test --locked --test cas_cli_e2e
+      - name: Run cfs end-to-end tests
         run: cargo test --locked --test e2e
