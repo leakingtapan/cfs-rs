@@ -33,13 +33,14 @@ pub fn upload<P: AsRef<Path>>(path: P, out: Option<P>, dry_run: bool) -> Result<
         upload_file(uploader, path)
     } else {
         Err(anyhow::Error::msg("unsupported file type"))
-    }?;
+    };
 
     if let Some(handle) = handle {
         handle
             .join()
             .map_err(|e| anyhow::Error::msg(format!("failed to join upload thread: {:?}", e)))??;
     }
+    let digest = digest?;
 
     let digest_str = format!("{}/{}", digest.hash, digest.size_bytes);
     match out {

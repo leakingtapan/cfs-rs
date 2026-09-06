@@ -143,6 +143,7 @@ dependencies = [
  "futures-util",
  "libc",
  "prost",
+ "prost-types",
  "rayon",
  "sha2",
  "tempfile",

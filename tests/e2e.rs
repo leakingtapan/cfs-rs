@@ -10,8 +10,14 @@ use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use support::cas::{reapi, InMemoryCas};
 use tempfile::TempDir;
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
 
 fn run_fsx(home: &Path, cas: &InMemoryCas, args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_fsx"))
@@ -50,14 +56,19 @@ fn configure_client(home: &Path, cas: &InMemoryCas) {
 
 #[test]
 fn all_supported_cas_workflows() {
+    let _env_guard = env_lock();
     let cas = InMemoryCas::start();
     let temp = TempDir::new().unwrap();
     configure_client(temp.path(), &cas);
 
     let fixture = temp.path().join("fixture");
     let nested = fixture.join("nested");
-    fs::create_dir_all(fixture.join(".git")).unwrap();
     fs::create_dir_all(&nested).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "--quiet", fixture.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
     fs::write(fixture.join("hello.txt"), b"hello from cfs").unwrap();
     fs::set_permissions(fixture.join("hello.txt"), fs::Permissions::from_mode(0o744)).unwrap();
     fs::write(nested.join("small.bin"), [0, 1, 2, 3, 4]).unwrap();
@@ -65,6 +76,31 @@ fn all_supported_cas_workflows() {
     fs::write(nested.join("large.bin"), &large).unwrap();
     fs::write(fixture.join(".git/ignored"), b"not uploaded").unwrap();
     symlink("hello.txt", fixture.join("hello-link")).unwrap();
+
+    for index in 0..17 {
+        let page_dir = fixture.join(format!("page-{:02}", index));
+        fs::create_dir(&page_dir).unwrap();
+        fs::write(page_dir.join("value"), format!("page {}", index)).unwrap();
+    }
+
+    let lfs_content = b"content stored through git lfs";
+    let lfs_hash = sha256(lfs_content);
+    let lfs_object = fixture
+        .join(".git/lfs/objects")
+        .join(&lfs_hash[0..2])
+        .join(&lfs_hash[2..4])
+        .join(&lfs_hash);
+    fs::create_dir_all(lfs_object.parent().unwrap()).unwrap();
+    fs::write(&lfs_object, lfs_content).unwrap();
+    fs::write(
+        fixture.join("asset.lfs"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+            lfs_hash,
+            lfs_content.len()
+        ),
+    )
+    .unwrap();
 
     let file_digest_path = temp.path().join("file.digest");
     run_fsx(
@@ -124,19 +160,33 @@ fn all_supported_cas_workflows() {
             .iter()
             .map(|node| node.name.as_str())
             .collect::<Vec<_>>(),
-        ["hello.txt"]
+        ["asset.lfs", "hello.txt"]
     );
-    assert_eq!(root.directories[0].name, "nested");
+    assert_eq!(
+        root.directories
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "nested", "page-00", "page-01", "page-02", "page-03", "page-04", "page-05", "page-06",
+            "page-07", "page-08", "page-09", "page-10", "page-11", "page-12", "page-13", "page-14",
+            "page-15", "page-16"
+        ]
+    );
     assert_eq!(root.symlinks[0].name, "hello-link");
     assert_eq!(root.symlinks[0].target, "hello.txt");
     assert_eq!(
-        root.files[0]
+        root.files
+            .iter()
+            .find(|node| node.name == "hello.txt")
+            .unwrap()
             .node_properties
             .as_ref()
             .and_then(|properties| properties.unix_mode),
         Some(0o100744)
     );
-    assert!(!root.files.iter().any(|node| node.name == "ignored"));
+    assert!(cas.blob(&sha256(b"not uploaded")).is_none());
+    assert_eq!(cas.blob(&lfs_hash).unwrap(), lfs_content);
 
     let nested_digest = root.directories[0].digest.as_ref().unwrap();
     let nested_bytes = cas
@@ -154,6 +204,7 @@ fn all_supported_cas_workflows() {
     assert_eq!(cas.blob(&sha256(&large)).unwrap(), large);
 
     let writes_before = cas.write_count(&root_digest.hash);
+    let large_writes_before = cas.write_count(&sha256(&large));
     run_fsx(
         temp.path(),
         &cas,
@@ -168,6 +219,11 @@ fn all_supported_cas_workflows() {
         cas.write_count(&root_digest.hash),
         writes_before,
         "existing blobs must not be uploaded again"
+    );
+    assert_eq!(
+        cas.write_count(&sha256(&large)),
+        large_writes_before,
+        "existing streamed blobs must not be uploaded again"
     );
 
     let seeded = cas.insert_blob(b"seeded by test harness".to_vec());
@@ -206,9 +262,11 @@ fn all_supported_cas_workflows() {
                 size_bytes: seeded.size_bytes,
             }),
             is_executable: false,
+            node_properties: None,
         }],
         directories: vec![],
         symlinks: vec![],
+        node_properties: None,
     };
     let seeded_directory_digest = cas.insert_directory(&seeded_directory);
     let mut cache = CacheClient::new().unwrap();
@@ -238,7 +296,17 @@ fn all_supported_cas_workflows() {
     let tree = client
         .get_tree(&root_digest.hash, root_digest.size_bytes)
         .unwrap();
-    assert_eq!(tree.len(), 2);
+    assert_eq!(tree.len(), 19);
+    let tree_root = &tree[0];
+    assert_eq!(
+        tree_root
+            .files
+            .iter()
+            .find(|node| node.name == "hello.txt")
+            .and_then(|node| node.node_properties.as_ref())
+            .and_then(|properties| properties.unix_mode),
+        Some(0o100744)
+    );
 
     let empty_digest = ReapiDigest {
         hash: sha256(&[]),

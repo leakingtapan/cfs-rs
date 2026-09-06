@@ -450,7 +450,6 @@ pub(crate) async fn create_cas_client() -> Result<CasClient> {
     ))
 }
 
-//TODO: handle pagination
 pub(crate) async fn read_directories(
     client: &mut CasClient,
     hash: &str,
@@ -469,8 +468,11 @@ pub(crate) async fn read_directories(
     let mut resp = client.get_tree(request).await?;
     let stream = resp.get_mut();
 
-    let message = stream.message().await?;
-    Ok(message.map_or(vec![], |resp| resp.directories))
+    let mut directories = Vec::new();
+    while let Some(mut response) = stream.message().await? {
+        directories.append(&mut response.directories);
+    }
+    Ok(directories)
 }
 
 /// Read the small blobs in batch. Do not use!

@@ -14,8 +14,12 @@ jobs:
   test:
     name: Unit and binary tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Run unit and binary tests
@@ -24,8 +28,12 @@ jobs:
   e2e:
     name: End-to-end tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Run end-to-end tests

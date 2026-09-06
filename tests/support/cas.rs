@@ -4,8 +4,10 @@ use prost::Message;
 use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener;
 use std::pin::Pin;
+use std::sync::mpsc::{self as sync_mpsc, Receiver};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -44,6 +46,7 @@ pub struct InMemoryCas {
     endpoint: String,
     service: CasService,
     shutdown: Option<oneshot::Sender<()>>,
+    done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -56,6 +59,7 @@ impl InMemoryCas {
             .expect("configure in-memory CAS listener");
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (done_tx, done_rx) = sync_mpsc::channel();
         let server_service = service.clone();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("create CAS runtime");
@@ -71,12 +75,14 @@ impl InMemoryCas {
                     .await
                     .expect("run in-memory CAS");
             });
+            let _ = done_tx.send(());
         });
 
         Self {
             endpoint,
             service,
             shutdown: Some(shutdown_tx),
+            done: done_rx,
             thread: Some(thread),
         }
     }
@@ -118,8 +124,10 @@ impl Drop for InMemoryCas {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("join in-memory CAS thread");
+        if self.done.recv_timeout(Duration::from_secs(10)).is_ok() {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("join in-memory CAS thread");
+            }
         }
     }
 }
@@ -144,6 +152,9 @@ fn require_auth<T>(request: &Request<T>) -> Result<(), Status> {
 }
 
 fn parse_digest(resource_name: &str) -> Result<Digest, Status> {
+    if !resource_name.starts_with("e2e/") || !resource_name.contains("/blobs/") {
+        return Err(Status::invalid_argument("invalid resource name"));
+    }
     let mut parts = resource_name.rsplit('/');
     let size_bytes = parts
         .next()
@@ -222,7 +233,9 @@ impl ByteStream for CasService {
                 return Err(Status::invalid_argument("non-contiguous write offset"));
             }
             match &resource_name {
-                Some(name) if name != &request.resource_name => {
+                Some(name)
+                    if !request.resource_name.is_empty() && name != &request.resource_name =>
+                {
                     return Err(Status::invalid_argument("resource name changed"));
                 }
                 None => resource_name = Some(request.resource_name.clone()),
@@ -272,9 +285,12 @@ impl ContentAddressableStorage for CasService {
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         require_auth(&request)?;
+        let request = request.into_inner();
+        if request.instance_name != "e2e" {
+            return Err(Status::invalid_argument("invalid instance name"));
+        }
         let blobs = self.blobs.read().unwrap();
         let missing_blob_digests = request
-            .into_inner()
             .blob_digests
             .into_iter()
             .filter(|digest| !blobs.contains_key(&digest.hash))
@@ -289,7 +305,11 @@ impl ContentAddressableStorage for CasService {
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
         require_auth(&request)?;
-        for update in request.into_inner().requests {
+        let request = request.into_inner();
+        if request.instance_name != "e2e" {
+            return Err(Status::invalid_argument("invalid instance name"));
+        }
+        for update in request.requests {
             let digest = update
                 .digest
                 .ok_or_else(|| Status::invalid_argument("missing digest"))?;
@@ -310,8 +330,16 @@ impl ContentAddressableStorage for CasService {
         request: Request<GetTreeRequest>,
     ) -> Result<Response<Self::GetTreeStream>, Status> {
         require_auth(&request)?;
+        let request = request.into_inner();
+        if request.instance_name != "e2e" {
+            return Err(Status::invalid_argument("invalid instance name"));
+        }
+        let page_size = if request.page_size <= 0 {
+            usize::MAX
+        } else {
+            request.page_size as usize
+        };
         let root = request
-            .into_inner()
             .root_digest
             .ok_or_else(|| Status::invalid_argument("missing root digest"))?;
         let blobs = self.blobs.read().unwrap();
@@ -332,10 +360,21 @@ impl ContentAddressableStorage for CasService {
             );
             directories.push(directory);
         }
-        let response = GetTreeResponse {
-            directories,
-            next_page_token: String::new(),
-        };
-        Ok(Response::new(Box::pin(stream::iter([Ok(response)]))))
+        let last_page = directories.len().saturating_sub(1) / page_size;
+        let responses = directories
+            .chunks(page_size)
+            .enumerate()
+            .map(|(index, page)| {
+                Ok(GetTreeResponse {
+                    directories: page.to_vec(),
+                    next_page_token: if index == last_page {
+                        String::new()
+                    } else {
+                        (index + 1).to_string()
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Response::new(Box::pin(stream::iter(responses))))
     }
 }

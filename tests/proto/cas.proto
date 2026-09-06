@@ -2,6 +2,9 @@ syntax = "proto3";
 
 package build.bazel.remote.execution.v2;
 
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
 service ContentAddressableStorage {
   rpc FindMissingBlobs(FindMissingBlobsRequest) returns (FindMissingBlobsResponse);
   rpc BatchUpdateBlobs(BatchUpdateBlobsRequest) returns (BatchUpdateBlobsResponse);
@@ -46,6 +49,7 @@ message FileNode {
   string name = 1;
   Digest digest = 2;
   bool is_executable = 4;
+  NodeProperties node_properties = 6;
 }
 
 message DirectoryNode {
@@ -56,12 +60,25 @@ message DirectoryNode {
 message SymlinkNode {
   string name = 1;
   string target = 2;
+  NodeProperties node_properties = 4;
+}
+
+message NodeProperty {
+  string name = 1;
+  string value = 2;
+}
+
+message NodeProperties {
+  repeated NodeProperty properties = 1;
+  google.protobuf.Timestamp mtime = 2;
+  google.protobuf.UInt32Value unix_mode = 3;
 }
 
 message Directory {
   repeated FileNode files = 1;
   repeated DirectoryNode directories = 2;
   repeated SymlinkNode symlinks = 3;
+  NodeProperties node_properties = 5;
 }
 
 message GetTreeResponse {

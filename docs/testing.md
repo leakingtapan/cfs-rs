@@ -46,11 +46,12 @@ cargo test --locked --all-targets
 - standalone file upload;
 - recursive directory upload and deterministic dry-run digest generation;
 - nested directories, symlinks, Unix file modes, and `.git` exclusion;
+- Git LFS pointers backed by locally populated LFS objects;
 - missing-blob filtering and upload deduplication;
 - batched small-blob and streamed large-blob uploads;
 - direct client blob and file writes, including empty blobs;
 - ByteStream downloads and cached reads;
-- directory decoding and CAS tree traversal;
+- directory decoding, paginated CAS tree traversal, and metadata preservation;
 - the `fsx upload`, `download`, `mount`, and `test` subcommands; and
 - invalid daemon arguments without requiring a privileged FUSE mount.
 
@@ -71,6 +72,9 @@ let directory_digest = cas.insert_directory(&directory);
 
 Use `cas.endpoint()` as `CAS_ENDPOINT`. The test helper in `tests/e2e.rs` also
 creates `~/.rbe-auth-token` using `cas.token()` and sets `INSTANCE_NAME`.
+Because those variables are process-global, in-process client tests hold the
+shared `env_lock()` guard while configuring and using them. New tests that
+change the same variables must use that guard as well.
 
 The harness validates authorization, resource names, SHA-256 digests, sizes,
 stream offsets, and finalization. It also exposes:
