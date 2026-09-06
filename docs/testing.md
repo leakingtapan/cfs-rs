@@ -39,6 +39,38 @@ To run every test target in one command:
 cargo test --locked --all-targets
 ```
 
+## Run the in-memory CAS
+
+Start a local CAS and optionally pre-populate it with files:
+
+```sh
+cargo run --bin cas -- \
+  --listen 127.0.0.1:50051 \
+  --instance-name memory \
+  --token test-token \
+  --seed-file examples/data/test1 \
+  --seed-file examples/data/test2
+```
+
+`--listen 127.0.0.1:0` selects an available port, which is useful in test
+scripts. The command prints the resolved `CAS_ENDPOINT`, `INSTANCE_NAME`,
+`CAS_TOKEN`, and a `SEEDED=<path>=<hash>/<size>` line for each seeded file. It
+prints `READY` after initialization and serves until Ctrl-C.
+
+Configure cfs-rs clients with the printed values:
+
+```sh
+export CAS_ENDPOINT=http://127.0.0.1:50051
+export INSTANCE_NAME=memory
+printf '%s' 'test-token' > "$HOME/.rbe-auth-token"
+
+cargo run --bin fsx -- download /tmp/test1 HASH/SIZE
+```
+
+The local service uses plaintext HTTP, so `CA_CERT_PATH` is not required.
+Seeded data is held only in memory and is discarded when the process exits.
+Run `cargo run --bin cas -- --help` for all options.
+
 ## E2E coverage
 
 `tests/e2e.rs` covers the currently supported cfs-rs workflows:
@@ -52,7 +84,8 @@ cargo test --locked --all-targets
 - direct client blob and file writes, including empty blobs;
 - ByteStream downloads and cached reads;
 - directory decoding, paginated CAS tree traversal, and metadata preservation;
-- the `fsx upload`, `download`, `mount`, and `test` subcommands; and
+- the `fsx upload`, `download`, `mount`, and `test` subcommands;
+- standalone `cas` startup, file seeding, client access, and shutdown; and
 - invalid daemon arguments without requiring a privileged FUSE mount.
 
 An actual FUSE mount requires Linux kernel support and privileges. CI compiles
@@ -60,7 +93,7 @@ the Linux daemon but does not mount a filesystem in its unprivileged jobs.
 
 ## In-memory CAS test data
 
-The reusable harness is in `tests/support/cas.rs`. Start it inside a test and
+The reusable harness is in `src/cas/memory.rs`. Start it inside a test and
 populate blobs or encoded REAPI directories before invoking cfs-rs:
 
 ```rust

@@ -1,7 +1,8 @@
-use cfs::hash::sha256;
+use crate::hash::sha256;
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::TcpListener;
 use std::pin::Pin;
 use std::sync::mpsc::{self as sync_mpsc, Receiver};
@@ -34,17 +35,17 @@ use reapi::{
     FindMissingBlobsResponse, GetTreeRequest, GetTreeResponse,
 };
 
-const TOKEN: &str = "test-token";
-
-#[derive(Clone, Default)]
-struct CasService {
+#[derive(Clone)]
+pub struct MemoryCas {
     blobs: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     writes: Arc<Mutex<HashMap<String, usize>>>,
+    instance_name: String,
+    token: String,
 }
 
 pub struct InMemoryCas {
     endpoint: String,
-    service: CasService,
+    service: MemoryCas,
     shutdown: Option<oneshot::Sender<()>>,
     done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
@@ -52,7 +53,11 @@ pub struct InMemoryCas {
 
 impl InMemoryCas {
     pub fn start() -> Self {
-        let service = CasService::default();
+        Self::start_with("e2e", "test-token")
+    }
+
+    pub fn start_with(instance_name: &str, token: &str) -> Self {
+        let service = MemoryCas::new(instance_name, token);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind in-memory CAS");
         listener
             .set_nonblocking(true)
@@ -66,9 +71,7 @@ impl InMemoryCas {
             runtime.block_on(async move {
                 let incoming =
                     TcpListenerStream::new(tokio::net::TcpListener::from_std(listener).unwrap());
-                Server::builder()
-                    .add_service(ByteStreamServer::new(server_service.clone()))
-                    .add_service(ContentAddressableStorageServer::new(server_service))
+                server_service
                     .serve_with_incoming_shutdown(incoming, async {
                         let _ = shutdown_rx.await;
                     })
@@ -92,14 +95,36 @@ impl InMemoryCas {
     }
 
     pub fn token(&self) -> &str {
-        TOKEN
+        self.service.token()
+    }
+
+    pub fn insert_blob(&self, data: impl Into<Vec<u8>>) -> Digest {
+        self.service.insert_blob(data)
+    }
+
+    pub fn insert_directory(&self, directory: &Directory) -> Digest {
+        self.service.insert_directory(directory)
+    }
+}
+
+impl MemoryCas {
+    pub fn new(instance_name: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            blobs: Arc::new(RwLock::new(HashMap::new())),
+            writes: Arc::new(Mutex::new(HashMap::new())),
+            instance_name: instance_name.into(),
+            token: token.into(),
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     pub fn insert_blob(&self, data: impl Into<Vec<u8>>) -> Digest {
         let data = data.into();
         let digest = digest(&data);
-        self.service
-            .blobs
+        self.blobs
             .write()
             .unwrap()
             .insert(digest.hash.clone(), data);
@@ -110,6 +135,63 @@ impl InMemoryCas {
         self.insert_blob(directory.encode_to_vec())
     }
 
+    pub async fn serve_with_incoming_shutdown<I, IO, IE, F>(
+        self,
+        incoming: I,
+        shutdown: F,
+    ) -> Result<(), tonic::transport::Error>
+    where
+        I: futures::Stream<Item = Result<IO, IE>> + Send + 'static,
+        IO: tokio::io::AsyncRead
+            + tokio::io::AsyncWrite
+            + tonic::transport::server::Connected
+            + Send
+            + Unpin
+            + 'static,
+        IE: Into<Box<dyn std::error::Error + Send + Sync>>,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Server::builder()
+            .add_service(ByteStreamServer::new(self.clone()))
+            .add_service(ContentAddressableStorageServer::new(self))
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await
+    }
+
+    fn require_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let value = request
+            .metadata()
+            .get("authorization")
+            .ok_or_else(|| Status::unauthenticated("missing authorization"))?;
+        if value == format!("Bearer {}", self.token).as_str() {
+            Ok(())
+        } else {
+            Err(Status::unauthenticated("invalid authorization"))
+        }
+    }
+
+    fn parse_digest(&self, resource_name: &str) -> Result<Digest, Status> {
+        let prefix = if self.instance_name.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{}/", self.instance_name)
+        };
+        if !resource_name.starts_with(&prefix) || !resource_name.contains("/blobs/") {
+            return Err(Status::invalid_argument("invalid resource name"));
+        }
+        parse_digest(resource_name)
+    }
+
+    fn require_instance(&self, instance_name: &str) -> Result<(), Status> {
+        if instance_name == self.instance_name {
+            Ok(())
+        } else {
+            Err(Status::invalid_argument("invalid instance name"))
+        }
+    }
+}
+
+impl InMemoryCas {
     pub fn blob(&self, hash: &str) -> Option<Vec<u8>> {
         self.service.blobs.read().unwrap().get(hash).cloned()
     }
@@ -139,22 +221,7 @@ fn digest(data: &[u8]) -> Digest {
     }
 }
 
-fn require_auth<T>(request: &Request<T>) -> Result<(), Status> {
-    let value = request
-        .metadata()
-        .get("authorization")
-        .ok_or_else(|| Status::unauthenticated("missing authorization"))?;
-    if value == format!("Bearer {}", TOKEN).as_str() {
-        Ok(())
-    } else {
-        Err(Status::unauthenticated("invalid authorization"))
-    }
-}
-
 fn parse_digest(resource_name: &str) -> Result<Digest, Status> {
-    if !resource_name.starts_with("e2e/") || !resource_name.contains("/blobs/") {
-        return Err(Status::invalid_argument("invalid resource name"));
-    }
     let mut parts = resource_name.rsplit('/');
     let size_bytes = parts
         .next()
@@ -178,16 +245,16 @@ fn validate_blob(expected: &Digest, data: &[u8]) -> Result<(), Status> {
 }
 
 #[tonic::async_trait]
-impl ByteStream for CasService {
+impl ByteStream for MemoryCas {
     type ReadStream = Pin<Box<dyn Stream<Item = Result<ReadResponse, Status>> + Send>>;
 
     async fn read(
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
-        require_auth(&request)?;
+        self.require_auth(&request)?;
         let request = request.into_inner();
-        let digest = parse_digest(&request.resource_name)?;
+        let digest = self.parse_digest(&request.resource_name)?;
         let blobs = self.blobs.read().unwrap();
         let data = blobs
             .get(&digest.hash)
@@ -219,7 +286,7 @@ impl ByteStream for CasService {
         &self,
         request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
-        require_auth(&request)?;
+        self.require_auth(&request)?;
         let mut stream = request.into_inner();
         let mut resource_name = None;
         let mut data = Vec::new();
@@ -248,7 +315,7 @@ impl ByteStream for CasService {
         if !finished {
             return Err(Status::invalid_argument("write was not finalized"));
         }
-        let digest = parse_digest(
+        let digest = self.parse_digest(
             resource_name
                 .as_deref()
                 .ok_or_else(|| Status::invalid_argument("empty write stream"))?,
@@ -268,8 +335,8 @@ impl ByteStream for CasService {
         &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        require_auth(&request)?;
-        let digest = parse_digest(&request.into_inner().resource_name)?;
+        self.require_auth(&request)?;
+        let digest = self.parse_digest(&request.into_inner().resource_name)?;
         let complete = self.blobs.read().unwrap().contains_key(&digest.hash);
         Ok(Response::new(QueryWriteStatusResponse {
             committed_size: if complete { digest.size_bytes } else { 0 },
@@ -279,16 +346,14 @@ impl ByteStream for CasService {
 }
 
 #[tonic::async_trait]
-impl ContentAddressableStorage for CasService {
+impl ContentAddressableStorage for MemoryCas {
     async fn find_missing_blobs(
         &self,
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
-        require_auth(&request)?;
+        self.require_auth(&request)?;
         let request = request.into_inner();
-        if request.instance_name != "e2e" {
-            return Err(Status::invalid_argument("invalid instance name"));
-        }
+        self.require_instance(&request.instance_name)?;
         let blobs = self.blobs.read().unwrap();
         let missing_blob_digests = request
             .blob_digests
@@ -304,11 +369,9 @@ impl ContentAddressableStorage for CasService {
         &self,
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
-        require_auth(&request)?;
+        self.require_auth(&request)?;
         let request = request.into_inner();
-        if request.instance_name != "e2e" {
-            return Err(Status::invalid_argument("invalid instance name"));
-        }
+        self.require_instance(&request.instance_name)?;
         for update in request.requests {
             let digest = update
                 .digest
@@ -329,11 +392,9 @@ impl ContentAddressableStorage for CasService {
         &self,
         request: Request<GetTreeRequest>,
     ) -> Result<Response<Self::GetTreeStream>, Status> {
-        require_auth(&request)?;
+        self.require_auth(&request)?;
         let request = request.into_inner();
-        if request.instance_name != "e2e" {
-            return Err(Status::invalid_argument("invalid instance name"));
-        }
+        self.require_instance(&request.instance_name)?;
         let page_size = if request.page_size <= 0 {
             usize::MAX
         } else {

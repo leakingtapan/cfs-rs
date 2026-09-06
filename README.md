@@ -102,7 +102,8 @@ cargo test --test e2e
 ```
 
 See the [testing guide](docs/testing.md) for prerequisites, coverage, CI
-behavior, and examples of populating the in-memory CAS harness.
+behavior, examples of populating the in-memory CAS harness, and instructions
+for running the standalone `cas` test server.
 
 ## Run the daemon
 ```sh

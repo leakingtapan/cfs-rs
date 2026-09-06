@@ -1,17 +1,16 @@
-mod support;
-
 use bazel_remote_apis_rs::build::bazel::remote::execution::v2::{
     Digest as ReapiDigest, Directory as ReapiDirectory,
 };
 use cfs::cas::blocking::{CacheClient, Client};
+use cfs::cas::memory::{reapi, InMemoryCas};
 use cfs::hash::sha256;
 use prost::Message;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use support::cas::{reapi, InMemoryCas};
 use tempfile::TempDir;
 
 fn env_lock() -> MutexGuard<'static, ()> {
@@ -20,11 +19,15 @@ fn env_lock() -> MutexGuard<'static, ()> {
 }
 
 fn run_fsx(home: &Path, cas: &InMemoryCas, args: &[&str]) -> Output {
+    run_fsx_at(home, cas.endpoint(), "e2e", args)
+}
+
+fn run_fsx_at(home: &Path, endpoint: &str, instance_name: &str, args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_fsx"))
         .args(args)
         .env("HOME", home)
-        .env("CAS_ENDPOINT", cas.endpoint())
-        .env("INSTANCE_NAME", "e2e")
+        .env("CAS_ENDPOINT", endpoint)
+        .env("INSTANCE_NAME", instance_name)
         .env_remove("CA_CERT_PATH")
         .output()
         .expect("run fsx");
@@ -52,6 +55,63 @@ fn configure_client(home: &Path, cas: &InMemoryCas) {
     std::env::set_var("CAS_ENDPOINT", cas.endpoint());
     std::env::set_var("INSTANCE_NAME", "e2e");
     std::env::remove_var("CA_CERT_PATH");
+}
+
+#[test]
+fn cas_cli_serves_seeded_files() {
+    let _env_guard = env_lock();
+    let temp = TempDir::new().unwrap();
+    let seed_path = temp.path().join("seed.txt");
+    let download_path = temp.path().join("download.txt");
+    let seed = b"seeded by cas cli";
+    fs::write(&seed_path, seed).unwrap();
+    fs::write(temp.path().join(".rbe-auth-token"), "cli-token\n").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cas"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--instance-name",
+            "cli-test",
+            "--token",
+            "cli-token",
+            "--seed-file",
+            seed_path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start cas CLI");
+
+    let mut endpoint = None;
+    let mut output = Vec::new();
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if let Some(value) = line.strip_prefix("CAS_ENDPOINT=") {
+            endpoint = Some(value.to_string());
+        }
+        let ready = line == "READY";
+        output.push(line);
+        if ready {
+            break;
+        }
+    }
+
+    let digest = format!("{}/{}", sha256(seed), seed.len());
+    assert!(output
+        .iter()
+        .any(|line| line == &format!("SEEDED={}={}", seed_path.display(), digest)));
+    run_fsx_at(
+        temp.path(),
+        endpoint.as_deref().expect("CAS endpoint"),
+        "cli-test",
+        &["download", download_path.to_str().unwrap(), digest.as_str()],
+    );
+    assert_eq!(fs::read(download_path).unwrap(), seed);
+
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]
