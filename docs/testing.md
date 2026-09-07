@@ -145,7 +145,7 @@ The reusable harness is in `src/cas/memory.rs`. Start it inside a test and
 populate blobs or encoded REAPI directories before invoking cfs-rs:
 
 ```rust
-let cas = InMemoryCas::start();
+let cas = TestCasServer::start();
 
 let file_digest = cas.insert_blob(b"fixture contents".to_vec());
 let directory_digest = cas.insert_directory(&directory);

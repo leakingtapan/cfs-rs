@@ -2,7 +2,7 @@ use bazel_remote_apis_rs::build::bazel::remote::execution::v2::{
     Digest as ReapiDigest, Directory as ReapiDirectory,
 };
 use cfs::cas::blocking::{CacheClient, Client};
-use cfs::cas::memory::{reapi, InMemoryCas};
+use cfs::cas::memory::{reapi, TestCasServer};
 use cfs::hash::sha256;
 use prost::Message;
 use std::fs;
@@ -18,7 +18,7 @@ fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
-fn run_fsx(home: &Path, cas: &InMemoryCas, args: &[&str]) -> Output {
+fn run_fsx(home: &Path, cas: &TestCasServer, args: &[&str]) -> Output {
     run_fsx_at(home, cas.endpoint(), "e2e", args)
 }
 
@@ -42,7 +42,7 @@ fn run_fsx_at(home: &Path, endpoint: &str, instance_name: &str, args: &[&str]) -
     output
 }
 
-fn run_cascli(home: &Path, cas: &InMemoryCas, args: &[&str]) -> Output {
+fn run_cascli(home: &Path, cas: &TestCasServer, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cascli"))
         .args(args)
         .env("HOME", home)
@@ -62,7 +62,7 @@ fn parse_digest(value: &str) -> ReapiDigest {
     }
 }
 
-fn configure_client(home: &Path, cas: &InMemoryCas) {
+fn configure_client(home: &Path, cas: &TestCasServer) {
     fs::write(home.join(".rbe-auth-token"), format!("{}\n", cas.token())).unwrap();
     std::env::set_var("HOME", home);
     std::env::set_var("CAS_ENDPOINT", cas.endpoint());
@@ -131,7 +131,7 @@ fn cas_cli_serves_seeded_files() {
 #[test]
 fn all_supported_cas_workflows() {
     let _env_guard = env_lock();
-    let cas = InMemoryCas::start();
+    let cas = TestCasServer::start();
     let temp = TempDir::new().unwrap();
     configure_client(temp.path(), &cas);
 

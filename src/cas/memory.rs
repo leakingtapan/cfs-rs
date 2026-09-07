@@ -36,28 +36,28 @@ use reapi::{
 };
 
 #[derive(Clone)]
-pub struct MemoryCas {
+pub struct MemoryCasService {
     blobs: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     writes: Arc<Mutex<HashMap<String, usize>>>,
     instance_name: String,
     token: String,
 }
 
-pub struct InMemoryCas {
+pub struct TestCasServer {
     endpoint: String,
-    service: MemoryCas,
+    service: MemoryCasService,
     shutdown: Option<oneshot::Sender<()>>,
     done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl InMemoryCas {
+impl TestCasServer {
     pub fn start() -> Self {
         Self::start_with("e2e", "test-token")
     }
 
     pub fn start_with(instance_name: &str, token: &str) -> Self {
-        let service = MemoryCas::new(instance_name, token);
+        let service = MemoryCasService::new(instance_name, token);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind in-memory CAS");
         listener
             .set_nonblocking(true)
@@ -107,7 +107,7 @@ impl InMemoryCas {
     }
 }
 
-impl MemoryCas {
+impl MemoryCasService {
     pub fn new(instance_name: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             blobs: Arc::new(RwLock::new(HashMap::new())),
@@ -191,7 +191,7 @@ impl MemoryCas {
     }
 }
 
-impl InMemoryCas {
+impl TestCasServer {
     pub fn blob(&self, hash: &str) -> Option<Vec<u8>> {
         self.service.blobs.read().unwrap().get(hash).cloned()
     }
@@ -201,7 +201,7 @@ impl InMemoryCas {
     }
 }
 
-impl Drop for InMemoryCas {
+impl Drop for TestCasServer {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -245,7 +245,7 @@ fn validate_blob(expected: &Digest, data: &[u8]) -> Result<(), Status> {
 }
 
 #[tonic::async_trait]
-impl ByteStream for MemoryCas {
+impl ByteStream for MemoryCasService {
     type ReadStream = Pin<Box<dyn Stream<Item = Result<ReadResponse, Status>> + Send>>;
 
     async fn read(
@@ -346,7 +346,7 @@ impl ByteStream for MemoryCas {
 }
 
 #[tonic::async_trait]
-impl ContentAddressableStorage for MemoryCas {
+impl ContentAddressableStorage for MemoryCasService {
     async fn find_missing_blobs(
         &self,
         request: Request<FindMissingBlobsRequest>,

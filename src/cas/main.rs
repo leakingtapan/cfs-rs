@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cfs::cas::memory::MemoryCas;
+use cfs::cas::memory::MemoryCasService;
 use clap::Parser;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let address = listener.local_addr()?;
-    let cas = MemoryCas::new(&args.instance_name, &args.token);
+    let cas = MemoryCasService::new(&args.instance_name, &args.token);
     #[cfg(unix)]
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
