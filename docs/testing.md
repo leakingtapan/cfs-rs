@@ -132,6 +132,12 @@ directory objects return a non-zero exit status.
 An actual FUSE mount requires Linux kernel support and privileges. CI compiles
 the Linux daemon but does not mount a filesystem in its unprivileged jobs.
 
+The workflows are separate `#[test]` cases. Each uses the shared `E2eFixture`
+setup, which serializes process-wide environment changes and owns an isolated
+temporary HOME plus `TestCasServer`. Dropping the fixture shuts down the server,
+removes its files, and releases the environment lock, including after a test
+failure.
+
 ## In-memory CAS test data
 
 The reusable service implementation is in `src/cas/memory.rs`, while its test

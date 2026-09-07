@@ -10,7 +10,7 @@ use prost::Message;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
@@ -77,6 +77,91 @@ fn configure_client(home: &Path, cas: &TestCasServer) {
     std::env::remove_var("CA_CERT_PATH");
 }
 
+struct E2eFixture {
+    cas: TestCasServer,
+    temp: TempDir,
+    _env_guard: MutexGuard<'static, ()>,
+}
+
+impl E2eFixture {
+    fn start() -> Self {
+        let env_guard = env_lock();
+        let cas = TestCasServer::start();
+        let temp = TempDir::new().unwrap();
+        configure_client(temp.path(), &cas);
+        Self {
+            cas,
+            temp,
+            _env_guard: env_guard,
+        }
+    }
+
+    fn home(&self) -> &Path {
+        self.temp.path()
+    }
+
+    fn fsx(&self, args: &[&str]) -> Output {
+        run_fsx(self.home(), &self.cas, args)
+    }
+
+    fn fsx_result(&self, args: &[&str]) -> Output {
+        run_fsx_at_result(self.home(), self.cas.endpoint(), "e2e", args)
+    }
+
+    fn cascli(&self, args: &[&str]) -> Output {
+        run_cascli(self.home(), &self.cas, args)
+    }
+
+    fn create_source_tree(&self) -> SourceTree {
+        let root = self.home().join("fixture");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("hello.txt"), b"hello from cfs").unwrap();
+        fs::set_permissions(root.join("hello.txt"), fs::Permissions::from_mode(0o744)).unwrap();
+        fs::write(nested.join("small.bin"), [0, 1, 2, 3, 4]).unwrap();
+        let large = vec![42; 3 * 1024 * 1024 + 1];
+        fs::write(nested.join("large.bin"), &large).unwrap();
+        fs::write(root.join(".git/ignored"), b"not uploaded").unwrap();
+        symlink("hello.txt", root.join("hello-link")).unwrap();
+
+        let lfs_content = b"content stored through git lfs";
+        let lfs_hash = sha256(lfs_content);
+        let lfs_object = root
+            .join(".git/lfs/objects")
+            .join(&lfs_hash[0..2])
+            .join(&lfs_hash[2..4])
+            .join(&lfs_hash);
+        fs::create_dir_all(lfs_object.parent().unwrap()).unwrap();
+        fs::write(&lfs_object, lfs_content).unwrap();
+        fs::write(
+            root.join("asset.lfs"),
+            format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+                lfs_hash,
+                lfs_content.len()
+            ),
+        )
+        .unwrap();
+
+        SourceTree {
+            root,
+            large,
+            lfs_hash,
+        }
+    }
+}
+
+struct SourceTree {
+    root: PathBuf,
+    large: Vec<u8>,
+    lfs_hash: String,
+}
+
 #[test]
 fn cas_cli_serves_seeded_files() {
     let _env_guard = env_lock();
@@ -135,136 +220,81 @@ fn cas_cli_serves_seeded_files() {
 }
 
 #[test]
-fn all_supported_cas_workflows() {
-    let _env_guard = env_lock();
-    let cas = TestCasServer::start();
-    let temp = TempDir::new().unwrap();
-    configure_client(temp.path(), &cas);
+fn upload_reports_invalid_paths_and_partial_batch_failures() {
+    let fixture = E2eFixture::start();
 
-    let missing = temp.path().join("does-not-exist");
-    let missing_output = run_fsx_at_result(
-        temp.path(),
-        cas.endpoint(),
-        "e2e",
-        &["upload", missing.to_str().unwrap()],
-    );
-    assert!(!missing_output.status.success());
-    assert!(String::from_utf8_lossy(&missing_output.stderr).contains("No such file"));
+    let missing = fixture.home().join("does-not-exist");
+    let output = fixture.fsx_result(&["upload", missing.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No such file"));
 
-    let fixture = temp.path().join("fixture");
-    let nested = fixture.join("nested");
-    fs::create_dir_all(&nested).unwrap();
-    assert!(Command::new("git")
-        .args(["init", "--quiet", fixture.to_str().unwrap()])
-        .status()
-        .unwrap()
-        .success());
-    fs::write(fixture.join("hello.txt"), b"hello from cfs").unwrap();
-    fs::set_permissions(fixture.join("hello.txt"), fs::Permissions::from_mode(0o744)).unwrap();
-    fs::write(nested.join("small.bin"), [0, 1, 2, 3, 4]).unwrap();
-    let large = vec![42; 3 * 1024 * 1024 + 1];
-    fs::write(nested.join("large.bin"), &large).unwrap();
-    fs::write(fixture.join(".git/ignored"), b"not uploaded").unwrap();
-    symlink("hello.txt", fixture.join("hello-link")).unwrap();
-
-    let partial_batch = temp.path().join("partial-batch");
-    fs::create_dir(&partial_batch).unwrap();
+    let batch = fixture.home().join("partial-batch");
+    fs::create_dir(&batch).unwrap();
     let accepted_data = b"accept this batch item";
     let accepted_hash = sha256(accepted_data);
-    fs::write(partial_batch.join("accepted.bin"), accepted_data).unwrap();
+    fs::write(batch.join("accepted.bin"), accepted_data).unwrap();
     let rejected_data = b"reject this batch item";
     let rejected_hash = sha256(rejected_data);
-    let rejected_path = partial_batch.join("rejected.bin");
-    fs::write(&rejected_path, rejected_data).unwrap();
-    cas.reject_batch_write(&rejected_hash);
-    let rejected_output = run_fsx_at_result(
-        temp.path(),
-        cas.endpoint(),
-        "e2e",
-        &["upload", partial_batch.to_str().unwrap()],
-    );
-    assert!(!rejected_output.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected_output.stderr).contains("injected batch upload failure")
-    );
-    assert_eq!(cas.blob(&accepted_hash).unwrap(), accepted_data);
-    assert!(cas.blob(&rejected_hash).is_none());
+    fs::write(batch.join("rejected.bin"), rejected_data).unwrap();
+    fixture.cas.reject_batch_write(&rejected_hash);
 
-    for index in 0..17 {
-        let page_dir = fixture.join(format!("page-{:02}", index));
-        fs::create_dir(&page_dir).unwrap();
-        fs::write(page_dir.join("value"), format!("page {}", index)).unwrap();
-    }
+    let output = fixture.fsx_result(&["upload", batch.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected batch upload failure"));
+    assert_eq!(fixture.cas.blob(&accepted_hash).unwrap(), accepted_data);
+    assert!(fixture.cas.blob(&rejected_hash).is_none());
+}
 
-    let lfs_content = b"content stored through git lfs";
-    let lfs_hash = sha256(lfs_content);
-    let lfs_object = fixture
-        .join(".git/lfs/objects")
-        .join(&lfs_hash[0..2])
-        .join(&lfs_hash[2..4])
-        .join(&lfs_hash);
-    fs::create_dir_all(lfs_object.parent().unwrap()).unwrap();
-    fs::write(&lfs_object, lfs_content).unwrap();
-    fs::write(
-        fixture.join("asset.lfs"),
-        format!(
-            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
-            lfs_hash,
-            lfs_content.len()
-        ),
-    )
-    .unwrap();
+#[test]
+fn upload_preserves_tree_content_metadata_and_deduplicates() {
+    let fixture = E2eFixture::start();
+    let source = fixture.create_source_tree();
 
-    let file_digest_path = temp.path().join("file.digest");
-    run_fsx(
-        temp.path(),
-        &cas,
-        &[
-            "upload",
-            fixture.join("hello.txt").to_str().unwrap(),
-            "--out",
-            file_digest_path.to_str().unwrap(),
-        ],
-    );
+    let file_digest_path = fixture.home().join("file.digest");
+    fixture.fsx(&[
+        "upload",
+        source.root.join("hello.txt").to_str().unwrap(),
+        "--out",
+        file_digest_path.to_str().unwrap(),
+    ]);
     let file_digest = parse_digest(&fs::read_to_string(file_digest_path).unwrap());
-    assert_eq!(cas.blob(&file_digest.hash).unwrap(), b"hello from cfs");
-
-    let dry_run_digest = temp.path().join("dry-run.digest");
-    run_fsx(
-        temp.path(),
-        &cas,
-        &[
-            "upload",
-            fixture.to_str().unwrap(),
-            "--dry-run",
-            "--out",
-            dry_run_digest.to_str().unwrap(),
-        ],
+    assert_eq!(
+        fixture.cas.blob(&file_digest.hash).unwrap(),
+        b"hello from cfs"
     );
-    let dry_run_digest = fs::read_to_string(dry_run_digest).unwrap();
+
+    let dry_run_digest_path = fixture.home().join("dry-run.digest");
+    fixture.fsx(&[
+        "upload",
+        source.root.to_str().unwrap(),
+        "--dry-run",
+        "--out",
+        dry_run_digest_path.to_str().unwrap(),
+    ]);
+    let dry_run_digest = fs::read_to_string(dry_run_digest_path).unwrap();
     assert!(
-        cas.blob(&parse_digest(&dry_run_digest).hash).is_none(),
+        fixture
+            .cas
+            .blob(&parse_digest(&dry_run_digest).hash)
+            .is_none(),
         "dry-run must not populate CAS"
     );
 
-    let root_digest_path = temp.path().join("root.digest");
-    run_fsx(
-        temp.path(),
-        &cas,
-        &[
-            "upload",
-            fixture.to_str().unwrap(),
-            "--out",
-            root_digest_path.to_str().unwrap(),
-        ],
-    );
+    let root_digest_path = fixture.home().join("root.digest");
+    fixture.fsx(&[
+        "upload",
+        source.root.to_str().unwrap(),
+        "--out",
+        root_digest_path.to_str().unwrap(),
+    ]);
     let root_digest = parse_digest(&fs::read_to_string(&root_digest_path).unwrap());
     assert_eq!(
         dry_run_digest.trim(),
         format!("{}/{}", root_digest.hash, root_digest.size_bytes)
     );
 
-    let root_bytes = cas
+    let root_bytes = fixture
+        .cas
         .blob(&root_digest.hash)
         .expect("uploaded root directory");
     let root = ReapiDirectory::decode(root_bytes.as_slice()).unwrap();
@@ -280,11 +310,7 @@ fn all_supported_cas_workflows() {
             .iter()
             .map(|node| node.name.as_str())
             .collect::<Vec<_>>(),
-        [
-            "nested", "page-00", "page-01", "page-02", "page-03", "page-04", "page-05", "page-06",
-            "page-07", "page-08", "page-09", "page-10", "page-11", "page-12", "page-13", "page-14",
-            "page-15", "page-16"
-        ]
+        ["nested"]
     );
     assert_eq!(root.symlinks[0].name, "hello-link");
     assert_eq!(root.symlinks[0].target, "hello.txt");
@@ -298,82 +324,77 @@ fn all_supported_cas_workflows() {
             .and_then(|properties| properties.unix_mode),
         Some(0o100744)
     );
-    assert!(cas.blob(&sha256(b"not uploaded")).is_none());
-    assert_eq!(cas.blob(&lfs_hash).unwrap(), lfs_content);
+    assert!(fixture.cas.blob(&sha256(b"not uploaded")).is_none());
+    assert_eq!(
+        fixture.cas.blob(&source.lfs_hash).unwrap(),
+        b"content stored through git lfs"
+    );
 
     let nested_digest = root.directories[0].digest.as_ref().unwrap();
-    let nested_bytes = cas
+    let nested_bytes = fixture
+        .cas
         .blob(&nested_digest.hash)
         .expect("uploaded nested directory");
-    let nested_directory = ReapiDirectory::decode(nested_bytes.as_slice()).unwrap();
+    let nested = ReapiDirectory::decode(nested_bytes.as_slice()).unwrap();
     assert_eq!(
-        nested_directory
+        nested
             .files
             .iter()
             .map(|node| node.name.as_str())
             .collect::<Vec<_>>(),
         ["large.bin", "small.bin"]
     );
-    assert_eq!(cas.blob(&sha256(&large)).unwrap(), large);
-
-    let writes_before = cas.write_count(&root_digest.hash);
-    let large_writes_before = cas.write_count(&sha256(&large));
-    run_fsx(
-        temp.path(),
-        &cas,
-        &[
-            "upload",
-            fixture.to_str().unwrap(),
-            "--out",
-            root_digest_path.to_str().unwrap(),
-        ],
-    );
     assert_eq!(
-        cas.write_count(&root_digest.hash),
-        writes_before,
-        "existing blobs must not be uploaded again"
-    );
-    assert_eq!(
-        cas.write_count(&sha256(&large)),
-        large_writes_before,
-        "existing streamed blobs must not be uploaded again"
+        fixture.cas.blob(&sha256(&source.large)).unwrap(),
+        source.large
     );
 
-    let seeded = cas.insert_blob(b"seeded by test harness".to_vec());
-    let download_path = temp.path().join("downloaded.txt");
-    let seeded_digest = format!("{}/{}", seeded.hash, seeded.size_bytes);
-    run_fsx(
-        temp.path(),
-        &cas,
-        &["download", download_path.to_str().unwrap(), &seeded_digest],
-    );
-    assert_eq!(fs::read(download_path).unwrap(), b"seeded by test harness");
+    let root_writes = fixture.cas.write_count(&root_digest.hash);
+    let large_hash = sha256(&source.large);
+    let large_writes = fixture.cas.write_count(&large_hash);
+    fixture.fsx(&[
+        "upload",
+        source.root.to_str().unwrap(),
+        "--out",
+        root_digest_path.to_str().unwrap(),
+    ]);
+    assert_eq!(fixture.cas.write_count(&root_digest.hash), root_writes);
+    assert_eq!(fixture.cas.write_count(&large_hash), large_writes);
+}
 
-    let inspect_output = run_fsx(
-        temp.path(),
-        &cas,
-        &["test", fixture.join("hello.txt").to_str().unwrap()],
-    );
-    assert!(String::from_utf8_lossy(&inspect_output.stdout).contains("hello from cfs"));
+#[test]
+fn fsx_download_test_and_mount_commands_work() {
+    let fixture = E2eFixture::start();
+    let seeded = fixture.cas.insert_blob(b"seeded by test harness".to_vec());
+    let digest = format!("{}/{}", seeded.hash, seeded.size_bytes);
 
-    let mount_path = temp.path().join("mount-link");
-    run_fsx(
-        temp.path(),
-        &cas,
-        &["mount", mount_path.to_str().unwrap(), &seeded_digest],
-    );
+    let download_path = fixture.home().join("downloaded.txt");
+    fixture.fsx(&["download", download_path.to_str().unwrap(), &digest]);
+    assert_eq!(fs::read(&download_path).unwrap(), b"seeded by test harness");
+
+    let output = fixture.fsx(&["test", download_path.to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("seeded by test harness"));
+
+    let mount_path = fixture.home().join("mount-link");
+    fixture.fsx(&["mount", mount_path.to_str().unwrap(), &digest]);
     assert_eq!(
         fs::read_link(mount_path).unwrap(),
-        Path::new(&format!("/home/cheng.pan/fuse/{}", seeded_digest))
+        Path::new(&format!("/home/cheng.pan/fuse/{}", digest))
     );
+}
 
-    let seeded_directory = reapi::Directory {
+#[test]
+fn cascli_inspects_blobs_directories_and_trees() {
+    let fixture = E2eFixture::start();
+    let seeded = fixture.cas.insert_blob(b"seeded by test harness".to_vec());
+    let seeded_digest = format!("{}/{}", seeded.hash, seeded.size_bytes);
+    let large = vec![42; 3 * 1024 * 1024 + 1];
+    let large_digest = fixture.cas.insert_blob(large.clone());
+
+    let nested = reapi::Directory {
         files: vec![reapi::FileNode {
-            name: "seeded.txt".to_string(),
-            digest: Some(reapi::Digest {
-                hash: seeded.hash.clone(),
-                size_bytes: seeded.size_bytes,
-            }),
+            name: "large.bin".to_string(),
+            digest: Some(large_digest.clone()),
             is_executable: false,
             node_properties: None,
         }],
@@ -381,102 +402,139 @@ fn all_supported_cas_workflows() {
         symlinks: vec![],
         node_properties: None,
     };
-    let seeded_directory_digest = cas.insert_directory(&seeded_directory);
-    let cat_output = run_cascli(temp.path(), &cas, &["cat", &seeded_digest]);
-    assert!(cat_output.status.success());
-    assert_eq!(cat_output.stdout, b"seeded by test harness");
+    let nested_digest = fixture.cas.insert_directory(&nested);
+    let root = reapi::Directory {
+        files: vec![reapi::FileNode {
+            name: "seeded.txt".to_string(),
+            digest: Some(seeded.clone()),
+            is_executable: false,
+            node_properties: None,
+        }],
+        directories: vec![reapi::DirectoryNode {
+            name: "nested".to_string(),
+            digest: Some(nested_digest),
+        }],
+        symlinks: vec![reapi::SymlinkNode {
+            name: "seeded-link".to_string(),
+            target: "seeded.txt".to_string(),
+            node_properties: None,
+        }],
+        node_properties: None,
+    };
+    let root_digest = fixture.cas.insert_directory(&root);
+    let root_digest = format!("{}/{}", root_digest.hash, root_digest.size_bytes);
 
-    let large_digest = format!("{}/{}", sha256(&large), large.len());
-    let large_cat_output = run_cascli(temp.path(), &cas, &["cat", &large_digest]);
-    assert!(large_cat_output.status.success());
-    assert_eq!(large_cat_output.stdout, large);
+    let output = fixture.cascli(&["cat", &seeded_digest]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"seeded by test harness");
 
-    let seeded_directory_digest_string = format!(
-        "{}/{}",
-        seeded_directory_digest.hash, seeded_directory_digest.size_bytes
-    );
-    let ls_output = run_cascli(
-        temp.path(),
-        &cas,
-        &["ls", seeded_directory_digest_string.as_str()],
-    );
-    assert!(
-        ls_output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&ls_output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(ls_output.stdout).unwrap(),
-        format!("file\tseeded.txt\t{}\n", seeded_digest)
-    );
+    let large_digest = format!("{}/{}", large_digest.hash, large_digest.size_bytes);
+    let output = fixture.cascli(&["cat", &large_digest]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, large);
 
-    let tree_output = run_cascli(
-        temp.path(),
-        &cas,
-        &[
-            "tree",
-            &format!("{}/{}", root_digest.hash, root_digest.size_bytes),
-        ],
-    );
-    assert!(
-        tree_output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&tree_output.stderr)
-    );
-    let tree_output = String::from_utf8(tree_output.stdout).unwrap();
-    assert!(tree_output.contains("directory\t.\t"));
-    assert!(tree_output.contains("directory\tnested\t"));
-    assert!(tree_output.contains("file\tnested/large.bin\t"));
-    assert!(tree_output.contains("symlink\thello-link\thello.txt"));
+    let output = fixture.cascli(&["ls", &root_digest]);
+    assert!(output.status.success());
+    let listing = String::from_utf8(output.stdout).unwrap();
+    assert!(listing.contains(&format!("file\tseeded.txt\t{}\n", seeded_digest)));
+    assert!(listing.contains("directory\tnested\t"));
+    assert!(listing.contains("symlink\tseeded-link\tseeded.txt"));
 
-    let malformed = run_cascli(temp.path(), &cas, &["cat", "invalid"]);
+    let output = fixture.cascli(&["tree", &root_digest]);
+    assert!(output.status.success());
+    let tree = String::from_utf8(output.stdout).unwrap();
+    assert!(tree.contains("directory\t.\t"));
+    assert!(tree.contains("directory\tnested\t"));
+    assert!(tree.contains("file\tnested/large.bin\t"));
+    assert!(tree.contains("symlink\tseeded-link\tseeded.txt"));
+
+    let malformed = fixture.cascli(&["cat", "invalid"]);
     assert!(!malformed.status.success());
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("HASH/SIZE"));
 
     let missing = format!("{}/1", "0".repeat(64));
-    let missing = run_cascli(temp.path(), &cas, &["cat", &missing]);
+    let missing = fixture.cascli(&["cat", &missing]);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("NotFound"));
+}
+
+#[test]
+fn cache_client_reuses_downloaded_blobs() {
+    let fixture = E2eFixture::start();
+    let seeded = fixture.cas.insert_blob(b"cached contents".to_vec());
+    let directory = reapi::Directory {
+        files: vec![reapi::FileNode {
+            name: "seeded.txt".to_string(),
+            digest: Some(seeded.clone()),
+            is_executable: false,
+            node_properties: None,
+        }],
+        directories: vec![],
+        symlinks: vec![],
+        node_properties: None,
+    };
+    let directory_digest = fixture.cas.insert_directory(&directory);
 
     let mut cache = CacheClient::new().unwrap();
-    let reads_before_cache = cas.read_count(&seeded.hash);
     assert_eq!(
         cache
             .read_blob(&seeded.hash, seeded.size_bytes)
             .unwrap()
             .as_slice(),
-        b"seeded by test harness"
+        b"cached contents"
     );
-    let reads_after_cache_fill = cas.read_count(&seeded.hash);
-    assert_eq!(reads_after_cache_fill, reads_before_cache + 1);
+    assert_eq!(fixture.cas.read_count(&seeded.hash), 1);
     assert_eq!(
         cache
             .read_blob(&seeded.hash, seeded.size_bytes)
             .unwrap()
             .as_slice(),
-        b"seeded by test harness"
+        b"cached contents"
     );
-    assert_eq!(cas.read_count(&seeded.hash), reads_after_cache_fill);
+    assert_eq!(fixture.cas.read_count(&seeded.hash), 1);
+
     let decoded = cache
-        .get_dir(
-            &seeded_directory_digest.hash,
-            seeded_directory_digest.size_bytes,
-        )
+        .get_dir(&directory_digest.hash, directory_digest.size_bytes)
         .unwrap();
     assert_eq!(decoded.files[0].name, "seeded.txt");
+}
+
+#[test]
+fn cas_client_reads_paginated_trees_and_writes_blobs() {
+    let fixture = E2eFixture::start();
+    let file = fixture.cas.insert_blob(b"tree file".to_vec());
+    let empty_directory = fixture.cas.insert_directory(&reapi::Directory::default());
+    let root = reapi::Directory {
+        files: vec![reapi::FileNode {
+            name: "mode.txt".to_string(),
+            digest: Some(file),
+            is_executable: true,
+            node_properties: Some(reapi::NodeProperties {
+                properties: vec![],
+                mtime: None,
+                unix_mode: Some(0o100744),
+            }),
+        }],
+        directories: (0..17)
+            .map(|index| reapi::DirectoryNode {
+                name: format!("page-{:02}", index),
+                digest: Some(empty_directory.clone()),
+            })
+            .collect(),
+        symlinks: vec![],
+        node_properties: None,
+    };
+    let root_digest = fixture.cas.insert_directory(&root);
 
     let mut client = Client::new().unwrap();
     let tree = client
         .get_tree(&root_digest.hash, root_digest.size_bytes)
         .unwrap();
-    assert_eq!(tree.len(), 19);
-    let tree_root = &tree[0];
+    assert_eq!(tree.len(), 18);
     assert_eq!(
-        tree_root
-            .files
-            .iter()
-            .find(|node| node.name == "hello.txt")
-            .and_then(|node| node.node_properties.as_ref())
+        tree[0].files[0]
+            .node_properties
+            .as_ref()
             .and_then(|properties| properties.unix_mode),
         Some(0o100744)
     );
@@ -486,23 +544,30 @@ fn all_supported_cas_workflows() {
         size_bytes: 0,
     };
     client.write_blob(&empty_digest, &[]).unwrap();
-    assert_eq!(cas.blob(&empty_digest.hash).unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        fixture.cas.blob(&empty_digest.hash).unwrap(),
+        Vec::<u8>::new()
+    );
 
-    let direct_file = temp.path().join("direct-write.txt");
-    fs::write(&direct_file, b"direct client write").unwrap();
-    let direct_digest = ReapiDigest {
+    let path = fixture.home().join("direct-write.txt");
+    fs::write(&path, b"direct client write").unwrap();
+    let digest = ReapiDigest {
         hash: sha256(b"direct client write"),
         size_bytes: 19,
     };
-    client.write_file(&direct_digest, &direct_file).unwrap();
+    client.write_file(&digest, &path).unwrap();
     assert_eq!(
-        cas.blob(&direct_digest.hash).unwrap(),
+        fixture.cas.blob(&digest.hash).unwrap(),
         b"direct client write"
     );
+}
 
-    let daemon = Command::new(env!("CARGO_BIN_EXE_cfsd"))
-        .args(["malformed-digest", temp.path().to_str().unwrap()])
+#[test]
+fn daemon_rejects_malformed_digest() {
+    let fixture = E2eFixture::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_cfsd"))
+        .args(["malformed-digest", fixture.home().to_str().unwrap()])
         .output()
         .expect("run cfsd");
-    assert!(!daemon.status.success());
+    assert!(!output.status.success());
 }
