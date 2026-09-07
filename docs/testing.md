@@ -141,15 +141,32 @@ the Linux daemon but does not mount a filesystem in its unprivileged jobs.
 
 ## In-memory CAS test data
 
-The reusable harness is in `src/cas/memory.rs`. Start it inside a test and
-populate blobs or encoded REAPI directories before invoking cfs-rs:
+The reusable implementation is in `src/cas/memory.rs` and has two types with
+separate responsibilities:
+
+- `MemoryCasService` is the core, cloneable REAPI CAS and ByteStream service.
+  It owns the in-memory objects and protocol validation but does not choose a
+  listener, runtime, thread, or shutdown policy. The standalone `cas` binary
+  uses this type directly.
+- `TestCasServer` is the test lifecycle wrapper. It creates a
+  `MemoryCasService`, binds an available loopback port, runs it on a background
+  Tokio thread, and shuts it down when dropped. It also forwards fixture and
+  inspection helpers to the service.
+
+Most tests should start `TestCasServer` and populate blobs or encoded REAPI
+directories before invoking cfs-rs:
 
 ```rust
+use cfs::cas::memory::TestCasServer;
+
 let cas = TestCasServer::start();
 
 let file_digest = cas.insert_blob(b"fixture contents".to_vec());
 let directory_digest = cas.insert_directory(&directory);
 ```
+
+Use `MemoryCasService` directly only when the caller needs to manage its own
+listener, runtime, or shutdown future.
 
 Use `cas.endpoint()` as `CAS_ENDPOINT`. The test helper in `tests/e2e.rs` also
 creates `~/.rbe-auth-token` using `cas.token()` and sets `INSTANCE_NAME`.
