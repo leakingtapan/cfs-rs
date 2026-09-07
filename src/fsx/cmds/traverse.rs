@@ -107,7 +107,7 @@ impl Traverse {
 
         // upload the blobs
         for (path, digest) in &res {
-            self.uploader.upload_file(digest, Path::new(path));
+            self.uploader.upload_file(digest, Path::new(path))?;
         }
 
         Ok(res)
@@ -132,7 +132,7 @@ impl Traverse {
             size_bytes: size,
         };
 
-        self.uploader.upload_blob(&digest, buff);
+        self.uploader.upload_blob(&digest, buff)?;
 
         Ok(digest)
     }

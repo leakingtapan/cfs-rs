@@ -14,7 +14,8 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
+use std::net::IpAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -88,6 +89,12 @@ impl Client {
             path.to_path_buf(),
         ))
     }
+
+    /// Streams a blob directly to the supplied writer without caching it.
+    pub fn read_blob_to<W: Write>(&mut self, hash: &str, size: i64, writer: &mut W) -> Result<()> {
+        self.rt
+            .block_on(bs_read_blob_to(&mut self.bs_client, hash, size, writer))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,38 +121,31 @@ pub struct NonBlockingClient {
     sender: mpsc::Sender<WriteTask>,
 }
 
-pub fn spawn_receiver() -> (mpsc::Sender<WriteTask>, JoinHandle<()>) {
+pub fn spawn_receiver() -> (mpsc::Sender<WriteTask>, JoinHandle<Result<()>>) {
     let (send, recv) = mpsc::channel(1024);
     let (ft_send, ft_recv) = mpsc::channel(1024);
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .build()
-            .unwrap();
-
-        rt.spawn(async move {
-            filter_loop(recv, ft_send).await;
-        });
+            .build()?;
 
         rt.block_on(async move {
-            receiver_loop(ft_recv).await;
-        });
+            let filter = tokio::spawn(filter_loop(recv, ft_send));
+            let receiver_result = receiver_loop(ft_recv).await;
+            filter.await??;
+            receiver_result
+        })
     });
 
     (send, handle)
 }
 
-async fn identical_filter_loop(mut recv: mpsc::Receiver<WriteTask>, send: mpsc::Sender<WriteTask>) {
-    while let Some(task) = recv.recv().await {
-        // println!("task: {:?}", task);
-        send.send(task).await;
-    }
-    //println!("identical filter loop done");
-}
-
-async fn filter_loop(mut recv: mpsc::Receiver<WriteTask>, send: mpsc::Sender<WriteTask>) {
+async fn filter_loop(
+    mut recv: mpsc::Receiver<WriteTask>,
+    send: mpsc::Sender<WriteTask>,
+) -> Result<()> {
     let mut pending = vec![];
-    let mut bt_client = create_cas_client().await.unwrap();
+    let mut bt_client = create_cas_client().await?;
     while let Some(task) = recv.recv().await {
         pending.push(task);
 
@@ -153,32 +153,28 @@ async fn filter_loop(mut recv: mpsc::Receiver<WriteTask>, send: mpsc::Sender<Wri
         if pending.len() >= 50000 {
             let mut filtered = vec![];
             filtered.append(&mut pending);
-            let filtered = find_missing_blobs(&mut bt_client, filtered).await;
+            let filtered = find_missing_blobs(&mut bt_client, filtered).await?;
 
             for t in filtered {
-                let res = send.send(t).await;
-                if res.is_err() {
-                    println!("failed to send the message {:?}", res.unwrap_err());
-                    break;
-                }
+                send.send(t).await?;
             }
         }
     }
 
     let mut filtered = vec![];
     filtered.append(&mut pending);
-    let filtered = find_missing_blobs(&mut bt_client, filtered).await;
+    let filtered = find_missing_blobs(&mut bt_client, filtered).await?;
 
     for t in filtered {
-        let res = send.send(t).await;
-        if res.is_err() {
-            println!("failed to send the message {:?}", res.unwrap_err());
-        }
+        send.send(t).await?;
     }
-    //println!("Missing blobs filter loop done");
+    Ok(())
 }
 
-async fn find_missing_blobs(bt_client: &mut CasClient, pending: Vec<WriteTask>) -> Vec<WriteTask> {
+async fn find_missing_blobs(
+    bt_client: &mut CasClient,
+    pending: Vec<WriteTask>,
+) -> Result<Vec<WriteTask>> {
     let mut digests = vec![];
     for p in pending.clone() {
         match p {
@@ -192,12 +188,7 @@ async fn find_missing_blobs(bt_client: &mut CasClient, pending: Vec<WriteTask>) 
         blob_digests: digests,
     };
 
-    let resp = bt_client.find_missing_blobs(request).await;
-    if resp.is_err() {
-        println!("failed to find missing blobs {}", resp.unwrap_err());
-        return vec![];
-    }
-    let resp = resp.unwrap();
+    let resp = bt_client.find_missing_blobs(request).await?;
 
     let mut missing_digests = HashSet::new();
     for d in &resp.get_ref().missing_blob_digests {
@@ -210,7 +201,7 @@ async fn find_missing_blobs(bt_client: &mut CasClient, pending: Vec<WriteTask>) 
         pending.len()
     );
 
-    pending
+    Ok(pending
         .into_iter()
         .filter(|e| {
             let d = match e {
@@ -219,7 +210,7 @@ async fn find_missing_blobs(bt_client: &mut CasClient, pending: Vec<WriteTask>) 
             };
             missing_digests.contains(&d.hash)
         })
-        .collect()
+        .collect())
 }
 
 /// The default max is 4MB
@@ -229,12 +220,12 @@ const GRPC_MAX_MESSGE_SIZE: i64 = 3 * 1024 * 1024;
 /// Limit the batch size to 2000 to avoid BatchUpdateBlob bug:
 const MAX_PENDING_REQUIEST_COUNT: usize = 2000;
 
-async fn receiver_loop(mut recv: mpsc::Receiver<WriteTask>) {
+async fn receiver_loop(mut recv: mpsc::Receiver<WriteTask>) -> Result<()> {
     // bytesteam client is used for streaming large objects
-    let mut bs_client = create_bs_client().await.unwrap();
+    let mut bs_client = create_bs_client().await?;
 
     // batch client is used for batching small objects
-    let mut bt_client = create_cas_client().await.unwrap();
+    let mut bt_client = create_cas_client().await?;
 
     let mut pending = vec![];
     let mut pending_size: i64 = 0;
@@ -246,83 +237,56 @@ async fn receiver_loop(mut recv: mpsc::Receiver<WriteTask>) {
                 // special case to fetch missing git lfs objects
                 // ideally this should be hide underneath so that file read
                 // could be treated transparently
-                let file = File::open(w.path.clone()).await;
-                if file.is_err() {
-                    continue;
-                }
-                let mut file = file.unwrap();
+                let mut file = File::open(w.path.clone()).await?;
                 // only need the first 100 bytes to determine file type
                 // round up to 256 bytes
                 // https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md
                 let mut buff = [0; 256];
-                let res = file.read(&mut buff).await;
-                if res.is_err() {
-                    println!("Failed to read the file {}", res.unwrap_err());
-                    continue;
-                }
+                file.read(&mut buff).await?;
 
                 let mut path = w.path.clone();
                 if let Ok(lfs_file) = LfsFile::new(&mut Cursor::new(buff)) {
-                    let parent_dir = &w.path.parent().unwrap();
-                    let git_root = get_git_root(&parent_dir).unwrap();
+                    let parent_dir = w
+                        .path
+                        .parent()
+                        .ok_or(anyhow::Error::msg("file has no parent directory"))?;
+                    let git_root = get_git_root(parent_dir)?;
                     let obj_path = get_lfs_object_path(git_root.clone(), lfs_file.hash.clone());
                     if !obj_path.exists() {
                         println!("digest {:?} is missing", w.digest);
                         // git lfs fetch -I requires relative path
-                        let rel_path = w.path.strip_prefix(git_root.clone());
-                        if rel_path.is_err() {
-                            println!(
-                                "failed to strip prefix {:?} {:?} {:?}",
-                                w.path,
-                                git_root.clone(),
-                                rel_path.unwrap_err()
-                            );
-                            continue;
-                        }
-                        let rel_path = rel_path.unwrap();
-                        let res = git_lfs_fetch(&git_root, &rel_path);
-                        if res.is_err() {
-                            println!("failed to fetch lfs object {}", res.unwrap_err());
-                            continue;
-                        }
+                        let rel_path = w.path.strip_prefix(git_root.clone())?;
+                        git_lfs_fetch(&git_root, rel_path)?;
                     }
                     path = obj_path;
                 }
 
                 // stream the large file out directly
                 if w.digest.size_bytes > GRPC_MAX_MESSGE_SIZE {
-                    bs_write_file(&mut bs_client, &w.digest, path).await;
+                    bs_write_file(&mut bs_client, &w.digest, path).await?;
                 } else {
                     // read small files into memory
-                    let file = File::open(path).await;
-                    if file.is_err() {
-                        continue;
-                    }
-                    let mut file = file.unwrap();
+                    let mut file = File::open(path).await?;
                     let mut buff = vec![];
-                    let res = file.read_to_end(&mut buff).await;
-                    if res.is_err() {
-                        println!("Failed to read the file {}", res.unwrap_err());
+                    file.read_to_end(&mut buff).await?;
+                    if pending_size + w.digest.size_bytes >= GRPC_MAX_MESSGE_SIZE
+                        || pending.len() > MAX_PENDING_REQUIEST_COUNT
+                    {
+                        ready.append(&mut pending);
+                        pending_size = w.digest.size_bytes;
                     } else {
-                        if pending_size + w.digest.size_bytes >= GRPC_MAX_MESSGE_SIZE
-                            || pending.len() > MAX_PENDING_REQUIEST_COUNT
-                        {
-                            ready.append(&mut pending);
-                            pending_size = w.digest.size_bytes;
-                        } else {
-                            pending_size += w.digest.size_bytes;
-                        }
-                        pending.push(WriteBlob {
-                            digest: w.digest,
-                            buff: buff,
-                        });
+                        pending_size += w.digest.size_bytes;
                     }
+                    pending.push(WriteBlob {
+                        digest: w.digest,
+                        buff,
+                    });
                 }
             }
             WriteTask::WriteBlob(w) => {
                 // stream out the large blob directly
                 if w.digest.size_bytes > GRPC_MAX_MESSGE_SIZE {
-                    bs_write_blob(&mut bs_client, &w.digest, w.buff).await;
+                    bs_write_blob(&mut bs_client, &w.digest, w.buff).await?;
                 } else {
                     if pending_size + w.digest.size_bytes >= GRPC_MAX_MESSGE_SIZE
                         || pending.len() > MAX_PENDING_REQUIEST_COUNT
@@ -350,14 +314,7 @@ async fn receiver_loop(mut recv: mpsc::Receiver<WriteTask>) {
                     compressor: 0,
                 });
             }
-            let request = BatchUpdateBlobsRequest {
-                instance_name: instance_name(),
-                requests: requests,
-            };
-            let resp = bt_client.batch_update_blobs(request).await;
-            if resp.is_err() {
-                println!("failed to batch upload {}", resp.unwrap_err());
-            }
+            send_batch_update(&mut bt_client, requests).await?;
             ready = vec![];
         }
     }
@@ -365,29 +322,78 @@ async fn receiver_loop(mut recv: mpsc::Receiver<WriteTask>) {
     // batch send the final remaining blobs before receiver exits
     if !pending.is_empty() {
         //println!("final batch {} requests", pending.len());
-        for t in pending {
-            let mut requests = vec![];
-            requests.push(batch_update_blobs_request::Request {
-                digest: Some(t.digest),
-                data: t.buff,
+        let requests = pending
+            .into_iter()
+            .map(|write| batch_update_blobs_request::Request {
+                digest: Some(write.digest),
+                data: write.buff,
                 compressor: 0,
-            });
-            let request = BatchUpdateBlobsRequest {
-                instance_name: instance_name(),
-                requests: requests,
-            };
-            let resp = bt_client.batch_update_blobs(request).await;
-            if resp.is_err() {
-                println!("failed to batch upload {}", resp.unwrap_err());
-            }
+            })
+            .collect();
+        send_batch_update(&mut bt_client, requests).await?;
+    }
+    Ok(())
+}
+
+async fn send_batch_update(
+    client: &mut CasClient,
+    requests: Vec<batch_update_blobs_request::Request>,
+) -> Result<()> {
+    let request_count = requests.len();
+    let mut expected = requests
+        .iter()
+        .map(|request| {
+            request
+                .digest
+                .as_ref()
+                .map(|digest| (digest.hash.clone(), digest.size_bytes))
+                .ok_or_else(|| anyhow::Error::msg("batch upload request is missing its digest"))
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    if expected.len() != request_count {
+        return Err(anyhow::Error::msg(
+            "batch upload request contains duplicate digests",
+        ));
+    }
+
+    let response = client
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            instance_name: instance_name(),
+            requests,
+        })
+        .await?
+        .into_inner();
+    if response.responses.len() != request_count {
+        return Err(anyhow::Error::msg(format!(
+            "batch upload returned {} responses for {} requests",
+            response.responses.len(),
+            request_count
+        )));
+    }
+    for response in response.responses {
+        let digest = response
+            .digest
+            .ok_or_else(|| anyhow::Error::msg("batch upload response is missing its digest"))?;
+        if !expected.remove(&(digest.hash.clone(), digest.size_bytes)) {
+            return Err(anyhow::Error::msg(format!(
+                "batch upload returned an unexpected digest {}/{}",
+                digest.hash, digest.size_bytes
+            )));
+        }
+        let status = response.status.ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "batch upload response for {}/{} is missing its status",
+                digest.hash, digest.size_bytes
+            ))
+        })?;
+        if status.code != 0 {
+            return Err(anyhow::Error::msg(format!(
+                "batch upload rejected {}/{}: {} (code {})",
+                digest.hash, digest.size_bytes, status.message, status.code
+            )));
         }
     }
-    //println!("receiver done");
-
-    // Once all senders have gone out of scope,
-    // the `.recv()` call returns None and it will
-    // exit from the while loop and shut down the
-    // thread.
+    Ok(())
 }
 
 impl NonBlockingClient {
@@ -474,16 +480,66 @@ pub(crate) async fn create_channel() -> Result<Channel> {
     //TODO: better system ca cert handling
     //let ca_cert = tokio::fs::read("/etc/ssl/certs/ca-certificates.crt").await?;
     let cas_endpoint = env::var("CAS_ENDPOINT")?;
-    let ca_cert_path = env::var("CA_CERT_PATH")?;
-    let ca_cert = tokio::fs::read(ca_cert_path).await?;
-    let ca_cert = Certificate::from_pem(ca_cert);
-    let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
-    let channel = Channel::from_shared(cas_endpoint)?
-        .tls_config(tls)?
-        .connect()
-        .await?;
+    let endpoint = Channel::from_shared(cas_endpoint.clone())?;
+    let channel = if cas_endpoint.starts_with("https://") {
+        let ca_cert_path = env::var("CA_CERT_PATH")?;
+        let ca_cert = tokio::fs::read(ca_cert_path).await?;
+        let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_cert));
+        endpoint.tls_config(tls)?.connect().await?
+    } else if cas_endpoint.starts_with("http://")
+        && insecure_http_enabled()
+        && is_loopback_endpoint(&cas_endpoint)
+    {
+        endpoint.connect().await?
+    } else {
+        return Err(anyhow::Error::msg(
+            "plaintext CAS requires a loopback endpoint and CAS_ALLOW_INSECURE_HTTP=true",
+        ));
+    };
 
     Ok(channel)
+}
+
+fn insecure_http_enabled() -> bool {
+    matches!(
+        env::var("CAS_ALLOW_INSECURE_HTTP").as_deref(),
+        Ok("true") | Ok("1")
+    )
+}
+
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let authority = match endpoint
+        .strip_prefix("http://")
+        .and_then(|value| value.split('/').next())
+    {
+        Some(authority) if !authority.is_empty() && !authority.contains('@') => authority,
+        _ => return false,
+    };
+    let host = if let Some(authority) = authority.strip_prefix('[') {
+        match authority.split_once(']') {
+            Some((host, "")) | Some((host, ":")) => host,
+            Some((host, port))
+                if port
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .is_some() =>
+            {
+                host
+            }
+            _ => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => host,
+            _ => authority,
+        }
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
 }
 
 pub(crate) async fn create_bs_client() -> Result<BsClient> {
@@ -503,7 +559,6 @@ pub(crate) async fn create_cas_client() -> Result<CasClient> {
     ))
 }
 
-//TODO: handle pagination
 pub(crate) async fn read_directories(
     client: &mut CasClient,
     hash: &str,
@@ -522,8 +577,11 @@ pub(crate) async fn read_directories(
     let mut resp = client.get_tree(request).await?;
     let stream = resp.get_mut();
 
-    let message = stream.message().await?;
-    Ok(message.map_or(vec![], |resp| resp.directories))
+    let mut directories = Vec::new();
+    while let Some(mut response) = stream.message().await? {
+        directories.append(&mut response.directories);
+    }
+    Ok(directories)
 }
 
 /// Read the small blobs in batch. Do not use!
@@ -572,6 +630,25 @@ pub(crate) async fn bs_read_blob(client: &mut BsClient, hash: &str, size: i64) -
     Ok(content)
 }
 
+async fn bs_read_blob_to<W: Write>(
+    client: &mut BsClient,
+    hash: &str,
+    size: i64,
+    writer: &mut W,
+) -> Result<()> {
+    let resource_name = format!("{}/blobs/{}/{}", instance_name(), hash, size);
+    let request = ReadRequest {
+        resource_name,
+        read_offset: 0,
+        read_limit: 0,
+    };
+    let mut response = client.read(request).await?;
+    while let Some(message) = response.get_mut().message().await? {
+        writer.write_all(&message.data)?;
+    }
+    Ok(())
+}
+
 // resource_name includes digests this means the digest has to
 // be calculated before uploading the blob this also means we
 // cannot compute the hash and upload the blob at the same time
@@ -613,6 +690,8 @@ struct WriteRequestStream<T: AsyncRead + Send + Unpin> {
     read: T,
     resource_name: String,
     offset: i64,
+    size: i64,
+    finished: bool,
 }
 
 impl<T: AsyncRead + Send + Unpin> WriteRequestStream<T> {
@@ -627,6 +706,8 @@ impl<T: AsyncRead + Send + Unpin> WriteRequestStream<T> {
             read: read,
             resource_name: resource_name,
             offset: 0,
+            size: digest.size_bytes,
+            finished: false,
         }
     }
 }
@@ -635,35 +716,31 @@ impl<T: AsyncRead + Send + Unpin> Stream for WriteRequestStream<T> {
     type Item = WriteRequest;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+
         let mut buff = [0; 16 * 1024];
         let mut read_buff = ReadBuf::new(&mut buff);
         match Pin::new(&mut self.read).poll_read(cx, &mut read_buff) {
-            Poll::Ready(_) => {
+            Poll::Ready(Ok(())) => {
                 let buff = read_buff.filled();
-                let size = buff.len() as i64;
-                // println!(
-                //     "{} size: {} offset: {}",
-                //     self.resource_name.clone(),
-                //     size,
-                //     self.offset
-                // );
-                self.offset += size;
-                if size == 0 {
+                let chunk_size = buff.len() as i64;
+                if chunk_size == 0 && self.size != 0 {
                     Poll::Ready(None)
                 } else {
+                    let write_offset = self.offset;
+                    self.offset += chunk_size;
+                    self.finished = self.offset == self.size;
                     Poll::Ready(Some(WriteRequest {
                         resource_name: self.resource_name.clone(),
-                        write_offset: self.offset,
-                        finish_write: size == 0,
+                        write_offset,
+                        finish_write: self.finished,
                         data: buff.to_vec(),
                     }))
                 }
             }
-            //TODO: when this happen?
-            // Poll::Ready(Err(e)) => {
-            // println!("Failed to read stream {}", e);
-            // Poll::Pending
-            // }
+            Poll::Ready(Err(_)) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -674,5 +751,30 @@ fn instance_name() -> String {
     match env::var("INSTANCE_NAME") {
         Ok(v) => v,
         Err(_) => String::from(""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_endpoint;
+
+    #[test]
+    fn recognizes_only_loopback_http_endpoints() {
+        for endpoint in [
+            "http://localhost:50051",
+            "http://127.0.0.1:50051",
+            "http://127.1.2.3",
+            "http://[::1]:50051",
+        ] {
+            assert!(is_loopback_endpoint(endpoint), "rejected {}", endpoint);
+        }
+        for endpoint in [
+            "http://example.com:50051",
+            "http://192.168.1.1:50051",
+            "https://localhost:50051",
+            "http://user@localhost:50051",
+        ] {
+            assert!(!is_loopback_endpoint(endpoint), "accepted {}", endpoint);
+        }
     }
 }

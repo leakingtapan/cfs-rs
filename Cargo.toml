@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2018"
 rust-version = "1.57.0"
 
+[features]
+test-utils = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -11,10 +14,10 @@ anyhow = "1.0.52"
 tokio = {version = "1.18.0", features = ["full"]}
 tonic = {version = "0.6.2", features = ["tls"]}
 bazel-remote-apis-rs = { git = "https://github.com/leakingtapan/bazel-remote-apis-rs", branch = "main" }
-fuser = {version = "0.9.1", features = ["abi-7-28"]}
 clap = {version = "3.1.18", features = ["cargo", "derive"]}
 libc = "0.2.112"
 prost = "0.9.0"
+prost-types = "0.9.0"
 sha2 = "0.10.1"
 uuid = { version = "0.8.2", features = ["v4"]  }
 futures-util = "0.3.19"
@@ -23,6 +26,15 @@ rayon = "1.5.1"
 bytes = "1.1.0"
 tokio-util = { version = "0.7.2", features = ["codec"] }
 futures = "0.3.21"
+tokio-stream = { version = "0.1.8", features = ["net"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = {version = "0.9.1", default-features = false, features = ["abi-7-28"]}
+
+[dev-dependencies]
+tempfile = "3.3.0"
+tonic-build = "0.6.2"
+once_cell = "=1.9.0"
 
 [[bin]]
 name = "cfsd"
@@ -31,3 +43,16 @@ path = "src/daemon/main.rs"
 [[bin]]
 name = "fsx"
 path = "src/fsx/main.rs"
+
+[[bin]]
+name = "cas"
+path = "src/cas/main.rs"
+
+[[bin]]
+name = "cascli"
+path = "src/cascli/main.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["test-utils"]

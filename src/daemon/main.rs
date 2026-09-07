@@ -1,8 +1,11 @@
 use anyhow::Result;
+#[cfg(target_os = "linux")]
 use clap::{crate_version, Arg, Command};
 
+#[cfg(target_os = "linux")]
 mod fuse;
 
+#[cfg(target_os = "linux")]
 fn main() -> Result<()> {
     let app = Command::new("cfs daemon")
         .version(crate_version!())
@@ -34,4 +37,9 @@ fn main() -> Result<()> {
 
     let mountpoint = app.value_of("MOUNT_POINT").unwrap();
     fuse::run(mountpoint, hash, size).map_err(|e| e.into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> Result<()> {
+    Err(anyhow::Error::msg("cfsd is only supported on Linux"))
 }

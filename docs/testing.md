@@ -1,0 +1,214 @@
+# Testing cfs-rs
+
+The project has two test layers:
+
+- Unit and binary tests validate hashing, Git LFS pointer parsing, and that the
+  binaries compile as test targets.
+- End-to-end tests run the real `fsx` binary and CAS clients against an
+  in-memory implementation of the Bazel Remote Execution CAS and ByteStream
+  APIs.
+
+The E2E tests do not require an external CAS, credentials, TLS certificate, or
+FUSE mount.
+
+## Prerequisites
+
+Install Rust. The generated test protocol bindings are checked into
+`src/cas/generated`, so normal builds and test runs do not require the Protocol
+Buffers compiler (`protoc`).
+
+## Run the tests
+
+Run the same test targets used by CI:
+
+```sh
+cargo test --locked --lib --bins
+cargo test --locked --test cas_cli_e2e
+cargo test --locked --features test-utils --test e2e
+```
+
+To run every test target in one command:
+
+```sh
+cargo test --locked --features test-utils --all-targets
+```
+
+## Run the in-memory CAS
+
+Start a local CAS and optionally pre-populate it with files:
+
+```sh
+cargo run --bin cas -- \
+  --listen 127.0.0.1:50051 \
+  --instance-name memory \
+  --token test-token \
+  --seed-file examples/data/test1 \
+  --seed-file examples/data/test2
+```
+
+`--listen 127.0.0.1:0` selects an available port, which is useful in test
+scripts. The command prints the resolved `CAS_ENDPOINT`, `INSTANCE_NAME`,
+`CAS_ALLOW_INSECURE_HTTP`, `CAS_TOKEN`, and a
+`SEEDED=<path>=<hash>/<size>` line for each seeded file. It prints `READY`
+after initialization and serves until Ctrl-C.
+
+Configure cfs-rs clients with the printed values:
+
+```sh
+export CAS_ENDPOINT=http://127.0.0.1:50051
+export INSTANCE_NAME=memory
+export CAS_ALLOW_INSECURE_HTTP=true
+printf '%s' 'test-token' > "$HOME/.rbe-auth-token"
+
+cargo run --bin fsx -- download /tmp/test1 HASH/SIZE
+```
+
+The local service uses plaintext HTTP, so `CA_CERT_PATH` is not required.
+To prevent bearer credentials from being sent to arbitrary plaintext hosts,
+cfs-rs accepts HTTP only for loopback endpoints and only when
+`CAS_ALLOW_INSECURE_HTTP=true` is explicitly set. Production CAS endpoints
+continue to require HTTPS and a CA certificate.
+Seeded data is held only in memory and is discarded when the process exits.
+Run `cargo run --bin cas -- --help` for all options.
+
+## Inspect CAS objects
+
+With `CAS_ENDPOINT`, `INSTANCE_NAME`, and `~/.rbe-auth-token` configured, use
+`cascli` to inspect blobs and REAPI directories:
+
+```sh
+# Write the exact blob bytes to stdout.
+cargo run --bin cascli -- cat HASH/SIZE
+
+# List one encoded Directory.
+cargo run --bin cascli -- ls HASH/SIZE
+
+# Recursively walk an encoded Directory tree.
+cargo run --bin cascli -- tree HASH/SIZE
+```
+
+`cat` does not add formatting or a trailing newline, so redirect it when
+inspecting binary data:
+
+```sh
+cargo run --bin cascli -- cat HASH/SIZE > /tmp/blob
+```
+
+`ls` and `tree` print tab-separated records:
+
+```text
+file       path/to/file       hash/size
+directory  path/to/directory  hash/size
+symlink    path/to/link       target
+```
+
+Backslashes, tabs, newlines, and carriage returns in paths or symlink targets
+are escaped as `\\`, `\t`, `\n`, and `\r`, respectively, so each object remains
+one tab-separated record.
+
+The `ls` and `tree` commands require the supplied digest to contain an encoded
+Bazel REAPI `Directory`. Missing blobs, malformed digests, and malformed
+directory objects return a non-zero exit status.
+
+## E2E coverage
+
+`tests/e2e.rs` covers the currently supported cfs-rs workflows:
+
+- standalone file upload;
+- recursive directory upload and deterministic dry-run digest generation;
+- nested directories, symlinks, Unix file modes, and `.git` exclusion;
+- Git LFS pointers backed by locally populated LFS objects;
+- missing-blob filtering and upload deduplication;
+- batched small-blob and streamed large-blob uploads;
+- direct client blob and file writes, including empty blobs;
+- ByteStream downloads and cached reads;
+- directory decoding, paginated CAS tree traversal, and metadata preservation;
+- the `fsx upload`, `download`, `mount`, and `test` subcommands;
+- standalone `cas` startup, file seeding, client access, and shutdown;
+- dedicated `cas` and `cascli` process interoperability in `cas_cli_e2e`;
+- `cascli` raw blob, directory listing, and recursive tree inspection; and
+- invalid daemon arguments without requiring a privileged FUSE mount.
+
+An actual FUSE mount requires Linux kernel support and privileges. CI compiles
+the Linux daemon but does not mount a filesystem in its unprivileged jobs.
+
+The workflows are separate `#[test]` cases. Each uses the shared `E2eFixture`
+setup, which serializes process-wide environment changes and owns an isolated
+temporary HOME plus `TestCasServer`. Dropping the fixture shuts down the server,
+removes its files, and releases the environment lock, including after a test
+failure.
+
+## In-memory CAS test data
+
+The reusable service implementation is in `src/cas/memory.rs`, while its test
+lifecycle wrapper is isolated in `src/cas/test_server.rs`:
+
+- `MemoryCasService` is the core, cloneable REAPI CAS and ByteStream service.
+  It owns the in-memory objects and protocol validation but does not choose a
+  listener, runtime, thread, or shutdown policy. The standalone `cas` binary
+  uses this type directly.
+- `TestCasServer` is available only through the non-default `test-utils`
+  feature. It creates a
+  `MemoryCasService`, binds an available loopback port, runs it on a background
+  Tokio thread, and shuts it down when dropped. It also forwards fixture and
+  inspection helpers to the service.
+
+Most tests should start `TestCasServer` and populate blobs or encoded REAPI
+directories before invoking cfs-rs:
+
+```rust
+use cfs::cas::test_server::TestCasServer;
+
+let cas = TestCasServer::start();
+
+let file_digest = cas.insert_blob(b"fixture contents".to_vec());
+let directory_digest = cas.insert_directory(&directory);
+```
+
+Use `MemoryCasService` directly only when the caller needs to manage its own
+listener, runtime, or shutdown future.
+
+Run tests that import `TestCasServer` with `--features test-utils`. Without
+that feature, the `cas::test_server` module and the service's test counters and
+failure-injection state are not compiled.
+
+Use `cas.endpoint()` as `CAS_ENDPOINT`. The test helper in `tests/e2e.rs` also
+creates `~/.rbe-auth-token` using `cas.token()` and sets `INSTANCE_NAME`.
+Because those variables are process-global, in-process client tests hold the
+shared `env_lock()` guard while configuring and using them. New tests that
+change the same variables must use that guard as well.
+
+The harness validates authorization, resource names, SHA-256 digests, sizes,
+stream offsets, and finalization. It also exposes:
+
+- `blob(hash)` to inspect stored content; and
+- `write_count(hash)` to assert that existing content was not uploaded again.
+
+Keep the server strict when extending it. Protocol validation is what lets the
+E2E suite catch client defects that a permissive fake would hide.
+
+### Regenerate test protocol bindings
+
+Only contributors changing files in `tests/proto` need `protoc`. After
+installing it, regenerate and commit the bindings:
+
+```sh
+cargo run --example generate_test_protos
+```
+
+`tests/proto/cas.proto` is intentionally a minimal subset of the upstream
+[REAPI schema](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto).
+The included RPCs, fields, enum values, tags, and reserved tags mirror upstream;
+unimplemented RPCs and unrelated messages are omitted.
+
+## CI
+
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests with
+separate jobs for:
+
+1. unit and binary tests; and
+2. end-to-end tests, with explicit `cas_cli_e2e` interoperability coverage
+   before the broader cfs E2E target.
+
+Both jobs use `--locked` so dependency resolution matches `Cargo.lock`; neither
+job installs `protoc`.
