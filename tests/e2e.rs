@@ -28,6 +28,7 @@ fn run_fsx_at(home: &Path, endpoint: &str, instance_name: &str, args: &[&str]) -
         .env("HOME", home)
         .env("CAS_ENDPOINT", endpoint)
         .env("INSTANCE_NAME", instance_name)
+        .env("CAS_ALLOW_INSECURE_HTTP", "true")
         .env_remove("CA_CERT_PATH")
         .output()
         .expect("run fsx");
@@ -47,6 +48,7 @@ fn run_cascli(home: &Path, cas: &InMemoryCas, args: &[&str]) -> Output {
         .env("HOME", home)
         .env("CAS_ENDPOINT", cas.endpoint())
         .env("INSTANCE_NAME", "e2e")
+        .env("CAS_ALLOW_INSECURE_HTTP", "true")
         .env_remove("CA_CERT_PATH")
         .output()
         .expect("run cascli")
@@ -65,6 +67,7 @@ fn configure_client(home: &Path, cas: &InMemoryCas) {
     std::env::set_var("HOME", home);
     std::env::set_var("CAS_ENDPOINT", cas.endpoint());
     std::env::set_var("INSTANCE_NAME", "e2e");
+    std::env::set_var("CAS_ALLOW_INSECURE_HTTP", "true");
     std::env::remove_var("CA_CERT_PATH");
 }
 

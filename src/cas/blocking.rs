@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::io::{Cursor, Write};
+use std::net::IpAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -432,11 +433,60 @@ pub(crate) async fn create_channel() -> Result<Channel> {
         let ca_cert = tokio::fs::read(ca_cert_path).await?;
         let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_cert));
         endpoint.tls_config(tls)?.connect().await?
-    } else {
+    } else if cas_endpoint.starts_with("http://")
+        && insecure_http_enabled()
+        && is_loopback_endpoint(&cas_endpoint)
+    {
         endpoint.connect().await?
+    } else {
+        return Err(anyhow::Error::msg(
+            "plaintext CAS requires a loopback endpoint and CAS_ALLOW_INSECURE_HTTP=true",
+        ));
     };
 
     Ok(channel)
+}
+
+fn insecure_http_enabled() -> bool {
+    matches!(
+        env::var("CAS_ALLOW_INSECURE_HTTP").as_deref(),
+        Ok("true") | Ok("1")
+    )
+}
+
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let authority = match endpoint
+        .strip_prefix("http://")
+        .and_then(|value| value.split('/').next())
+    {
+        Some(authority) if !authority.is_empty() && !authority.contains('@') => authority,
+        _ => return false,
+    };
+    let host = if let Some(authority) = authority.strip_prefix('[') {
+        match authority.split_once(']') {
+            Some((host, "")) | Some((host, ":")) => host,
+            Some((host, port))
+                if port
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .is_some() =>
+            {
+                host
+            }
+            _ => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => host,
+            _ => authority,
+        }
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
 }
 
 pub(crate) async fn create_bs_client() -> Result<BsClient> {
@@ -648,5 +698,30 @@ fn instance_name() -> String {
     match env::var("INSTANCE_NAME") {
         Ok(v) => v,
         Err(_) => String::from(""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_endpoint;
+
+    #[test]
+    fn recognizes_only_loopback_http_endpoints() {
+        for endpoint in [
+            "http://localhost:50051",
+            "http://127.0.0.1:50051",
+            "http://127.1.2.3",
+            "http://[::1]:50051",
+        ] {
+            assert!(is_loopback_endpoint(endpoint), "rejected {}", endpoint);
+        }
+        for endpoint in [
+            "http://example.com:50051",
+            "http://192.168.1.1:50051",
+            "https://localhost:50051",
+            "http://user@localhost:50051",
+        ] {
+            assert!(!is_loopback_endpoint(endpoint), "accepted {}", endpoint);
+        }
     }
 }

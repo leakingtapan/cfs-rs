@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
 
     println!("CAS_ENDPOINT=http://{}", address);
     println!("INSTANCE_NAME={}", args.instance_name);
+    println!("CAS_ALLOW_INSECURE_HTTP=true");
     println!("CAS_TOKEN={}", args.token);
     for path in args.seed_file {
         let digest = cas.insert_blob(tokio::fs::read(&path).await?);

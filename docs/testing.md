@@ -55,20 +55,26 @@ cargo run --bin cas -- \
 
 `--listen 127.0.0.1:0` selects an available port, which is useful in test
 scripts. The command prints the resolved `CAS_ENDPOINT`, `INSTANCE_NAME`,
-`CAS_TOKEN`, and a `SEEDED=<path>=<hash>/<size>` line for each seeded file. It
-prints `READY` after initialization and serves until Ctrl-C.
+`CAS_ALLOW_INSECURE_HTTP`, `CAS_TOKEN`, and a
+`SEEDED=<path>=<hash>/<size>` line for each seeded file. It prints `READY`
+after initialization and serves until Ctrl-C.
 
 Configure cfs-rs clients with the printed values:
 
 ```sh
 export CAS_ENDPOINT=http://127.0.0.1:50051
 export INSTANCE_NAME=memory
+export CAS_ALLOW_INSECURE_HTTP=true
 printf '%s' 'test-token' > "$HOME/.rbe-auth-token"
 
 cargo run --bin fsx -- download /tmp/test1 HASH/SIZE
 ```
 
 The local service uses plaintext HTTP, so `CA_CERT_PATH` is not required.
+To prevent bearer credentials from being sent to arbitrary plaintext hosts,
+cfs-rs accepts HTTP only for loopback endpoints and only when
+`CAS_ALLOW_INSECURE_HTTP=true` is explicitly set. Production CAS endpoints
+continue to require HTTPS and a CA certificate.
 Seeded data is held only in memory and is discarded when the process exits.
 Run `cargo run --bin cas -- --help` for all options.
 

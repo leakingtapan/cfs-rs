@@ -74,6 +74,19 @@ fn cascli_inspects_the_standalone_cas() {
         .any(|line| line == &format!("SEEDED={}={}", seed_path.display(), digest)));
     let endpoint = endpoint.expect("cas reports its endpoint");
 
+    let insecure_without_opt_in = Command::new(env!("CARGO_BIN_EXE_cascli"))
+        .args(["cat", &digest])
+        .env("HOME", temp.path())
+        .env("CAS_ENDPOINT", &endpoint)
+        .env("INSTANCE_NAME", "interop")
+        .env_remove("CAS_ALLOW_INSECURE_HTTP")
+        .env_remove("CA_CERT_PATH")
+        .output()
+        .expect("run cascli without insecure HTTP opt-in");
+    assert!(!insecure_without_opt_in.status.success());
+    assert!(String::from_utf8_lossy(&insecure_without_opt_in.stderr)
+        .contains("CAS_ALLOW_INSECURE_HTTP=true"));
+
     let output = run_cascli(temp.path(), &endpoint, &["cat", &digest]);
     assert!(
         output.status.success(),
@@ -96,6 +109,7 @@ fn run_cascli(home: &std::path::Path, endpoint: &str, args: &[&str]) -> std::pro
         .env("HOME", home)
         .env("CAS_ENDPOINT", endpoint)
         .env("INSTANCE_NAME", "interop")
+        .env("CAS_ALLOW_INSECURE_HTTP", "true")
         .env_remove("CA_CERT_PATH")
         .output()
         .expect("run cascli")
