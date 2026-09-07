@@ -13,16 +13,9 @@ FUSE mount.
 
 ## Prerequisites
 
-Install Rust and the Protocol Buffers compiler (`protoc`). For example:
-
-```sh
-# macOS
-brew install protobuf
-
-# Ubuntu or Debian
-sudo apt-get update
-sudo apt-get install --yes protobuf-compiler
-```
+Install Rust. The generated test protocol bindings are checked into
+`src/cas/generated`, so normal builds and test runs do not require the Protocol
+Buffers compiler (`protoc`).
 
 ## Run the tests
 
@@ -183,14 +176,23 @@ stream offsets, and finalization. It also exposes:
 Keep the server strict when extending it. Protocol validation is what lets the
 E2E suite catch client defects that a permissive fake would hide.
 
+### Regenerate test protocol bindings
+
+Only contributors changing files in `tests/proto` need `protoc`. After
+installing it, regenerate and commit the bindings:
+
+```sh
+cargo run --example generate_test_protos
+```
+
 ## CI
 
-`.github/workflows/ci.yml` runs on pushes and pull requests with separate jobs
-for:
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests with
+separate jobs for:
 
 1. unit and binary tests; and
 2. end-to-end tests, with explicit `cas_cli_e2e` interoperability coverage
    before the broader cfs E2E target.
 
-Both jobs install `protoc` and use `--locked` so dependency resolution matches
-`Cargo.lock`.
+Both jobs use `--locked` so dependency resolution matches `Cargo.lock`; neither
+job installs `protoc`.

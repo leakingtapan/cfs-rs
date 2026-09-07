@@ -107,7 +107,7 @@ cargo build --release
 
 ## Test
 
-Install `protoc`, then run the unit and end-to-end suites:
+Run the unit and end-to-end suites:
 
 ```sh
 cargo test --lib --bins

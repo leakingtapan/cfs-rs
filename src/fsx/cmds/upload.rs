@@ -13,6 +13,13 @@ use tokio::sync::mpsc;
 /// following the bazel remote api direcotry's canonicalized structure
 /// [https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L789]
 pub fn upload<P: AsRef<Path>>(path: P, out: Option<P>, dry_run: bool) -> Result<()> {
+    let path = path.as_ref();
+    let metadata = fs::metadata(path)?;
+    let is_directory = metadata.is_dir();
+    if !is_directory && !metadata.is_file() {
+        return Err(anyhow::Error::msg("unsupported file type"));
+    }
+
     // Since receiver shutdown depends on all senders being out of scope,
     // need to create the receiver independent of the uploader (which uses sender)
     // to avoid cyclic dependency when joining the handle
@@ -24,15 +31,12 @@ pub fn upload<P: AsRef<Path>>(path: P, out: Option<P>, dry_run: bool) -> Result<
         (Box::new(CasBlobUploader::new(send)?), Some(handle))
     };
 
-    let path = path.as_ref();
     //println!("Uploading {}", path.display());
 
-    let digest = if path.is_dir() {
+    let digest = if is_directory {
         upload_dir(uploader, path)
-    } else if path.is_file() {
-        upload_file(uploader, path)
     } else {
-        Err(anyhow::Error::msg("unsupported file type"))
+        upload_file(uploader, path)
     };
 
     if let Some(handle) = handle {

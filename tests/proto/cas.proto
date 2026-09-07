@@ -4,6 +4,7 @@ package build.bazel.remote.execution.v2;
 
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
+import "google/rpc/status.proto";
 
 service ContentAddressableStorage {
   rpc FindMissingBlobs(FindMissingBlobsRequest) returns (FindMissingBlobsResponse);
@@ -36,7 +37,14 @@ message BatchUpdateBlobsRequest {
   repeated Request requests = 2;
 }
 
-message BatchUpdateBlobsResponse {}
+message BatchUpdateBlobsResponse {
+  message Response {
+    Digest digest = 1;
+    google.rpc.Status status = 2;
+  }
+
+  repeated Response responses = 1;
+}
 
 message GetTreeRequest {
   string instance_name = 1;

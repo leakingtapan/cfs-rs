@@ -314,11 +314,7 @@ async fn receiver_loop(mut recv: mpsc::Receiver<WriteTask>) -> Result<()> {
                     compressor: 0,
                 });
             }
-            let request = BatchUpdateBlobsRequest {
-                instance_name: instance_name(),
-                requests: requests,
-            };
-            bt_client.batch_update_blobs(request).await?;
+            send_batch_update(&mut bt_client, requests).await?;
             ready = vec![];
         }
     }
@@ -326,18 +322,75 @@ async fn receiver_loop(mut recv: mpsc::Receiver<WriteTask>) -> Result<()> {
     // batch send the final remaining blobs before receiver exits
     if !pending.is_empty() {
         //println!("final batch {} requests", pending.len());
-        for t in pending {
-            let mut requests = vec![];
-            requests.push(batch_update_blobs_request::Request {
-                digest: Some(t.digest),
-                data: t.buff,
+        let requests = pending
+            .into_iter()
+            .map(|write| batch_update_blobs_request::Request {
+                digest: Some(write.digest),
+                data: write.buff,
                 compressor: 0,
-            });
-            let request = BatchUpdateBlobsRequest {
-                instance_name: instance_name(),
-                requests: requests,
-            };
-            bt_client.batch_update_blobs(request).await?;
+            })
+            .collect();
+        send_batch_update(&mut bt_client, requests).await?;
+    }
+    Ok(())
+}
+
+async fn send_batch_update(
+    client: &mut CasClient,
+    requests: Vec<batch_update_blobs_request::Request>,
+) -> Result<()> {
+    let request_count = requests.len();
+    let mut expected = requests
+        .iter()
+        .map(|request| {
+            request
+                .digest
+                .as_ref()
+                .map(|digest| (digest.hash.clone(), digest.size_bytes))
+                .ok_or_else(|| anyhow::Error::msg("batch upload request is missing its digest"))
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    if expected.len() != request_count {
+        return Err(anyhow::Error::msg(
+            "batch upload request contains duplicate digests",
+        ));
+    }
+
+    let response = client
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            instance_name: instance_name(),
+            requests,
+        })
+        .await?
+        .into_inner();
+    if response.responses.len() != request_count {
+        return Err(anyhow::Error::msg(format!(
+            "batch upload returned {} responses for {} requests",
+            response.responses.len(),
+            request_count
+        )));
+    }
+    for response in response.responses {
+        let digest = response
+            .digest
+            .ok_or_else(|| anyhow::Error::msg("batch upload response is missing its digest"))?;
+        if !expected.remove(&(digest.hash.clone(), digest.size_bytes)) {
+            return Err(anyhow::Error::msg(format!(
+                "batch upload returned an unexpected digest {}/{}",
+                digest.hash, digest.size_bytes
+            )));
+        }
+        let status = response.status.ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "batch upload response for {}/{} is missing its status",
+                digest.hash, digest.size_bytes
+            ))
+        })?;
+        if status.code != 0 {
+            return Err(anyhow::Error::msg(format!(
+                "batch upload rejected {}/{}: {} (code {})",
+                digest.hash, digest.size_bytes, status.message, status.code
+            )));
         }
     }
     Ok(())

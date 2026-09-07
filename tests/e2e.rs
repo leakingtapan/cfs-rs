@@ -4,18 +4,19 @@ use bazel_remote_apis_rs::build::bazel::remote::execution::v2::{
 use cfs::cas::blocking::{CacheClient, Client};
 use cfs::cas::memory::{reapi, TestCasServer};
 use cfs::hash::sha256;
+use once_cell::sync::Lazy;
 use prost::Message;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
 fn env_lock() -> MutexGuard<'static, ()> {
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    ENV_LOCK.lock().unwrap()
 }
 
 fn run_fsx(home: &Path, cas: &TestCasServer, args: &[&str]) -> Output {
@@ -23,15 +24,7 @@ fn run_fsx(home: &Path, cas: &TestCasServer, args: &[&str]) -> Output {
 }
 
 fn run_fsx_at(home: &Path, endpoint: &str, instance_name: &str, args: &[&str]) -> Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_fsx"))
-        .args(args)
-        .env("HOME", home)
-        .env("CAS_ENDPOINT", endpoint)
-        .env("INSTANCE_NAME", instance_name)
-        .env("CAS_ALLOW_INSECURE_HTTP", "true")
-        .env_remove("CA_CERT_PATH")
-        .output()
-        .expect("run fsx");
+    let output = run_fsx_at_result(home, endpoint, instance_name, args);
     assert!(
         output.status.success(),
         "fsx {:?} failed\nstdout: {}\nstderr: {}",
@@ -40,6 +33,18 @@ fn run_fsx_at(home: &Path, endpoint: &str, instance_name: &str, args: &[&str]) -
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn run_fsx_at_result(home: &Path, endpoint: &str, instance_name: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_fsx"))
+        .args(args)
+        .env("HOME", home)
+        .env("CAS_ENDPOINT", endpoint)
+        .env("INSTANCE_NAME", instance_name)
+        .env("CAS_ALLOW_INSECURE_HTTP", "true")
+        .env_remove("CA_CERT_PATH")
+        .output()
+        .expect("run fsx")
 }
 
 fn run_cascli(home: &Path, cas: &TestCasServer, args: &[&str]) -> Output {
@@ -135,6 +140,16 @@ fn all_supported_cas_workflows() {
     let temp = TempDir::new().unwrap();
     configure_client(temp.path(), &cas);
 
+    let missing = temp.path().join("does-not-exist");
+    let missing_output = run_fsx_at_result(
+        temp.path(),
+        cas.endpoint(),
+        "e2e",
+        &["upload", missing.to_str().unwrap()],
+    );
+    assert!(!missing_output.status.success());
+    assert!(String::from_utf8_lossy(&missing_output.stderr).contains("No such file"));
+
     let fixture = temp.path().join("fixture");
     let nested = fixture.join("nested");
     fs::create_dir_all(&nested).unwrap();
@@ -150,6 +165,29 @@ fn all_supported_cas_workflows() {
     fs::write(nested.join("large.bin"), &large).unwrap();
     fs::write(fixture.join(".git/ignored"), b"not uploaded").unwrap();
     symlink("hello.txt", fixture.join("hello-link")).unwrap();
+
+    let partial_batch = temp.path().join("partial-batch");
+    fs::create_dir(&partial_batch).unwrap();
+    let accepted_data = b"accept this batch item";
+    let accepted_hash = sha256(accepted_data);
+    fs::write(partial_batch.join("accepted.bin"), accepted_data).unwrap();
+    let rejected_data = b"reject this batch item";
+    let rejected_hash = sha256(rejected_data);
+    let rejected_path = partial_batch.join("rejected.bin");
+    fs::write(&rejected_path, rejected_data).unwrap();
+    cas.reject_batch_write(&rejected_hash);
+    let rejected_output = run_fsx_at_result(
+        temp.path(),
+        cas.endpoint(),
+        "e2e",
+        &["upload", partial_batch.to_str().unwrap()],
+    );
+    assert!(!rejected_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected_output.stderr).contains("injected batch upload failure")
+    );
+    assert_eq!(cas.blob(&accepted_hash).unwrap(), accepted_data);
+    assert!(cas.blob(&rejected_hash).is_none());
 
     for index in 0..17 {
         let page_dir = fixture.join(format!("page-{:02}", index));
@@ -400,6 +438,7 @@ fn all_supported_cas_workflows() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("NotFound"));
 
     let mut cache = CacheClient::new().unwrap();
+    let reads_before_cache = cas.read_count(&seeded.hash);
     assert_eq!(
         cache
             .read_blob(&seeded.hash, seeded.size_bytes)
@@ -407,6 +446,8 @@ fn all_supported_cas_workflows() {
             .as_slice(),
         b"seeded by test harness"
     );
+    let reads_after_cache_fill = cas.read_count(&seeded.hash);
+    assert_eq!(reads_after_cache_fill, reads_before_cache + 1);
     assert_eq!(
         cache
             .read_blob(&seeded.hash, seeded.size_bytes)
@@ -414,6 +455,7 @@ fn all_supported_cas_workflows() {
             .as_slice(),
         b"seeded by test harness"
     );
+    assert_eq!(cas.read_count(&seeded.hash), reads_after_cache_fill);
     let decoded = cache
         .get_dir(
             &seeded_directory_digest.hash,

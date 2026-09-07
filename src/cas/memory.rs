@@ -1,7 +1,7 @@
 use crate::hash::sha256;
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::TcpListener;
 use std::pin::Pin;
@@ -15,13 +15,14 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 pub mod bytestream {
-    tonic::include_proto!("google.bytestream");
+    include!("generated/google.bytestream.rs");
 }
 
 pub mod reapi {
-    tonic::include_proto!("build.bazel.remote.execution.v2");
+    include!("generated/build.bazel.remote.execution.v2.rs");
 }
 
+use bazel_remote_apis_rs::google::rpc::Status as RpcStatus;
 use bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
 use bytestream::{
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
@@ -31,14 +32,16 @@ use reapi::content_addressable_storage_server::{
     ContentAddressableStorage, ContentAddressableStorageServer,
 };
 use reapi::{
-    BatchUpdateBlobsRequest, BatchUpdateBlobsResponse, Digest, Directory, FindMissingBlobsRequest,
-    FindMissingBlobsResponse, GetTreeRequest, GetTreeResponse,
+    batch_update_blobs_response, BatchUpdateBlobsRequest, BatchUpdateBlobsResponse, Digest,
+    Directory, FindMissingBlobsRequest, FindMissingBlobsResponse, GetTreeRequest, GetTreeResponse,
 };
 
 #[derive(Clone)]
 pub struct MemoryCasService {
     blobs: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     writes: Arc<Mutex<HashMap<String, usize>>>,
+    reads: Arc<Mutex<HashMap<String, usize>>>,
+    rejected_batch_writes: Arc<RwLock<HashSet<String>>>,
     instance_name: String,
     token: String,
 }
@@ -112,6 +115,8 @@ impl MemoryCasService {
         Self {
             blobs: Arc::new(RwLock::new(HashMap::new())),
             writes: Arc::new(Mutex::new(HashMap::new())),
+            reads: Arc::new(Mutex::new(HashMap::new())),
+            rejected_batch_writes: Arc::new(RwLock::new(HashSet::new())),
             instance_name: instance_name.into(),
             token: token.into(),
         }
@@ -199,6 +204,18 @@ impl TestCasServer {
     pub fn write_count(&self, hash: &str) -> usize {
         *self.service.writes.lock().unwrap().get(hash).unwrap_or(&0)
     }
+
+    pub fn read_count(&self, hash: &str) -> usize {
+        *self.service.reads.lock().unwrap().get(hash).unwrap_or(&0)
+    }
+
+    pub fn reject_batch_write(&self, hash: impl Into<String>) {
+        self.service
+            .rejected_batch_writes
+            .write()
+            .unwrap()
+            .insert(hash.into());
+    }
 }
 
 impl Drop for TestCasServer {
@@ -260,6 +277,12 @@ impl ByteStream for MemoryCasService {
             .get(&digest.hash)
             .ok_or_else(|| Status::not_found("blob not found"))?;
         validate_blob(&digest, data)?;
+        *self
+            .reads
+            .lock()
+            .unwrap()
+            .entry(digest.hash.clone())
+            .or_default() += 1;
         if request.read_offset < 0 || request.read_offset > data.len() as i64 {
             return Err(Status::out_of_range("invalid read offset"));
         }
@@ -372,18 +395,54 @@ impl ContentAddressableStorage for MemoryCasService {
         self.require_auth(&request)?;
         let request = request.into_inner();
         self.require_instance(&request.instance_name)?;
+        let mut responses = Vec::with_capacity(request.requests.len());
         for update in request.requests {
-            let digest = update
-                .digest
-                .ok_or_else(|| Status::invalid_argument("missing digest"))?;
-            validate_blob(&digest, &update.data)?;
-            self.blobs
-                .write()
-                .unwrap()
-                .insert(digest.hash.clone(), update.data);
-            *self.writes.lock().unwrap().entry(digest.hash).or_default() += 1;
+            let digest = update.digest;
+            let result = match digest.as_ref() {
+                None => Err(Status::invalid_argument("missing digest")),
+                Some(digest)
+                    if self
+                        .rejected_batch_writes
+                        .read()
+                        .unwrap()
+                        .contains(&digest.hash) =>
+                {
+                    Err(Status::internal("injected batch upload failure"))
+                }
+                Some(digest) => validate_blob(digest, &update.data),
+            };
+
+            if result.is_ok() {
+                let digest = digest.as_ref().unwrap();
+                self.blobs
+                    .write()
+                    .unwrap()
+                    .insert(digest.hash.clone(), update.data);
+                *self
+                    .writes
+                    .lock()
+                    .unwrap()
+                    .entry(digest.hash.clone())
+                    .or_default() += 1;
+            }
+            let status = match result {
+                Ok(()) => RpcStatus {
+                    code: 0,
+                    message: String::new(),
+                    details: Vec::new(),
+                },
+                Err(error) => RpcStatus {
+                    code: error.code() as i32,
+                    message: error.message().to_string(),
+                    details: Vec::new(),
+                },
+            };
+            responses.push(batch_update_blobs_response::Response {
+                digest,
+                status: Some(status),
+            });
         }
-        Ok(Response::new(BatchUpdateBlobsResponse {}))
+        Ok(Response::new(BatchUpdateBlobsResponse { responses }))
     }
 
     type GetTreeStream = Pin<Box<dyn Stream<Item = Result<GetTreeResponse, Status>> + Send>>;

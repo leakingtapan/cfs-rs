@@ -22,8 +22,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Run unit and binary tests
         run: cargo test --locked --lib --bins
 
@@ -36,8 +34,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Test cas with cascli
         run: cargo test --locked --test cas_cli_e2e
       - name: Run cfs end-to-end tests

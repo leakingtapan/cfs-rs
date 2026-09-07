@@ -142,6 +142,7 @@ dependencies = [
  "futures",
  "futures-util",
  "libc",
+ "once_cell",
  "prost",
  "prost-types",
  "rayon",
