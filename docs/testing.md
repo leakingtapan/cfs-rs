@@ -190,6 +190,11 @@ installing it, regenerate and commit the bindings:
 cargo run --example generate_test_protos
 ```
 
+`tests/proto/cas.proto` is intentionally a minimal subset of the upstream
+[REAPI schema](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto).
+The included RPCs, fields, enum values, tags, and reserved tags mirror upstream;
+unimplemented RPCs and unrelated messages are omitted.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on pushes to `main` and on pull requests with

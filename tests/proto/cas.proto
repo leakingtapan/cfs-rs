@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package build.bazel.remote.execution.v2;
 
+// Minimal subset of remote_execution.proto used by the in-memory test service.
+
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
 import "google/rpc/status.proto";
@@ -17,9 +19,35 @@ message Digest {
   int64 size_bytes = 2;
 }
 
+message DigestFunction {
+  enum Value {
+    UNKNOWN = 0;
+    SHA256 = 1;
+    SHA1 = 2;
+    MD5 = 3;
+    VSO = 4;
+    SHA384 = 5;
+    SHA512 = 6;
+    MURMUR3 = 7;
+    SHA256TREE = 8;
+    BLAKE3 = 9;
+    GITSHA1 = 10;
+  }
+}
+
+message Compressor {
+  enum Value {
+    IDENTITY = 0;
+    ZSTD = 1;
+    DEFLATE = 2;
+    BROTLI = 3;
+  }
+}
+
 message FindMissingBlobsRequest {
   string instance_name = 1;
   repeated Digest blob_digests = 2;
+  DigestFunction.Value digest_function = 3;
 }
 
 message FindMissingBlobsResponse {
@@ -30,11 +58,12 @@ message BatchUpdateBlobsRequest {
   message Request {
     Digest digest = 1;
     bytes data = 2;
-    int32 compressor = 3;
+    Compressor.Value compressor = 3;
   }
 
   string instance_name = 1;
   repeated Request requests = 2;
+  DigestFunction.Value digest_function = 5;
 }
 
 message BatchUpdateBlobsResponse {
@@ -51,12 +80,15 @@ message GetTreeRequest {
   Digest root_digest = 2;
   int32 page_size = 3;
   string page_token = 4;
+  DigestFunction.Value digest_function = 5;
 }
 
 message FileNode {
   string name = 1;
   Digest digest = 2;
+  reserved 3;
   bool is_executable = 4;
+  reserved 5;
   NodeProperties node_properties = 6;
 }
 
@@ -68,6 +100,7 @@ message DirectoryNode {
 message SymlinkNode {
   string name = 1;
   string target = 2;
+  reserved 3;
   NodeProperties node_properties = 4;
 }
 
@@ -86,6 +119,7 @@ message Directory {
   repeated FileNode files = 1;
   repeated DirectoryNode directories = 2;
   repeated SymlinkNode symlinks = 3;
+  reserved 4;
   NodeProperties node_properties = 5;
 }
 

@@ -6,11 +6,46 @@ pub struct Digest {
     pub size_bytes: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DigestFunction {}
+/// Nested message and enum types in `DigestFunction`.
+pub mod digest_function {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Value {
+        Unknown = 0,
+        Sha256 = 1,
+        Sha1 = 2,
+        Md5 = 3,
+        Vso = 4,
+        Sha384 = 5,
+        Sha512 = 6,
+        Murmur3 = 7,
+        Sha256tree = 8,
+        Blake3 = 9,
+        Gitsha1 = 10,
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Compressor {}
+/// Nested message and enum types in `Compressor`.
+pub mod compressor {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Value {
+        Identity = 0,
+        Zstd = 1,
+        Deflate = 2,
+        Brotli = 3,
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FindMissingBlobsRequest {
     #[prost(string, tag = "1")]
     pub instance_name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub blob_digests: ::prost::alloc::vec::Vec<Digest>,
+    #[prost(enumeration = "digest_function::Value", tag = "3")]
+    pub digest_function: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FindMissingBlobsResponse {
@@ -23,6 +58,8 @@ pub struct BatchUpdateBlobsRequest {
     pub instance_name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub requests: ::prost::alloc::vec::Vec<batch_update_blobs_request::Request>,
+    #[prost(enumeration = "digest_function::Value", tag = "5")]
+    pub digest_function: i32,
 }
 /// Nested message and enum types in `BatchUpdateBlobsRequest`.
 pub mod batch_update_blobs_request {
@@ -32,7 +69,7 @@ pub mod batch_update_blobs_request {
         pub digest: ::core::option::Option<super::Digest>,
         #[prost(bytes = "vec", tag = "2")]
         pub data: ::prost::alloc::vec::Vec<u8>,
-        #[prost(int32, tag = "3")]
+        #[prost(enumeration = "super::compressor::Value", tag = "3")]
         pub compressor: i32,
     }
 }
@@ -61,6 +98,8 @@ pub struct GetTreeRequest {
     pub page_size: i32,
     #[prost(string, tag = "4")]
     pub page_token: ::prost::alloc::string::String,
+    #[prost(enumeration = "digest_function::Value", tag = "5")]
+    pub digest_function: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FileNode {
