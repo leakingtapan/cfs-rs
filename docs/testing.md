@@ -24,13 +24,13 @@ Run the same test targets used by CI:
 ```sh
 cargo test --locked --lib --bins
 cargo test --locked --test cas_cli_e2e
-cargo test --locked --test e2e
+cargo test --locked --features test-utils --test e2e
 ```
 
 To run every test target in one command:
 
 ```sh
-cargo test --locked --all-targets
+cargo test --locked --features test-utils --all-targets
 ```
 
 ## Run the in-memory CAS
@@ -134,14 +134,15 @@ the Linux daemon but does not mount a filesystem in its unprivileged jobs.
 
 ## In-memory CAS test data
 
-The reusable implementation is in `src/cas/memory.rs` and has two types with
-separate responsibilities:
+The reusable service implementation is in `src/cas/memory.rs`, while its test
+lifecycle wrapper is isolated in `src/cas/test_server.rs`:
 
 - `MemoryCasService` is the core, cloneable REAPI CAS and ByteStream service.
   It owns the in-memory objects and protocol validation but does not choose a
   listener, runtime, thread, or shutdown policy. The standalone `cas` binary
   uses this type directly.
-- `TestCasServer` is the test lifecycle wrapper. It creates a
+- `TestCasServer` is available only through the non-default `test-utils`
+  feature. It creates a
   `MemoryCasService`, binds an available loopback port, runs it on a background
   Tokio thread, and shuts it down when dropped. It also forwards fixture and
   inspection helpers to the service.
@@ -150,7 +151,7 @@ Most tests should start `TestCasServer` and populate blobs or encoded REAPI
 directories before invoking cfs-rs:
 
 ```rust
-use cfs::cas::memory::TestCasServer;
+use cfs::cas::test_server::TestCasServer;
 
 let cas = TestCasServer::start();
 
@@ -160,6 +161,10 @@ let directory_digest = cas.insert_directory(&directory);
 
 Use `MemoryCasService` directly only when the caller needs to manage its own
 listener, runtime, or shutdown future.
+
+Run tests that import `TestCasServer` with `--features test-utils`. Without
+that feature, the `cas::test_server` module and the service's test counters and
+failure-injection state are not compiled.
 
 Use `cas.endpoint()` as `CAS_ENDPOINT`. The test helper in `tests/e2e.rs` also
 creates `~/.rbe-auth-token` using `cas.token()` and sets `INSTANCE_NAME`.

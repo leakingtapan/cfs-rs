@@ -1,16 +1,14 @@
 use crate::hash::sha256;
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(feature = "test-utils")]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::TcpListener;
 use std::pin::Pin;
-use std::sync::mpsc::{self as sync_mpsc, Receiver};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
-use std::time::Duration;
-use tokio::sync::oneshot;
-use tokio_stream::wrappers::TcpListenerStream;
+#[cfg(feature = "test-utils")]
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -39,83 +37,25 @@ use reapi::{
 #[derive(Clone)]
 pub struct MemoryCasService {
     blobs: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    #[cfg(feature = "test-utils")]
     writes: Arc<Mutex<HashMap<String, usize>>>,
+    #[cfg(feature = "test-utils")]
     reads: Arc<Mutex<HashMap<String, usize>>>,
+    #[cfg(feature = "test-utils")]
     rejected_batch_writes: Arc<RwLock<HashSet<String>>>,
     instance_name: String,
     token: String,
-}
-
-pub struct TestCasServer {
-    endpoint: String,
-    service: MemoryCasService,
-    shutdown: Option<oneshot::Sender<()>>,
-    done: Receiver<()>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl TestCasServer {
-    pub fn start() -> Self {
-        Self::start_with("e2e", "test-token")
-    }
-
-    pub fn start_with(instance_name: &str, token: &str) -> Self {
-        let service = MemoryCasService::new(instance_name, token);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind in-memory CAS");
-        listener
-            .set_nonblocking(true)
-            .expect("configure in-memory CAS listener");
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (done_tx, done_rx) = sync_mpsc::channel();
-        let server_service = service.clone();
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("create CAS runtime");
-            runtime.block_on(async move {
-                let incoming =
-                    TcpListenerStream::new(tokio::net::TcpListener::from_std(listener).unwrap());
-                server_service
-                    .serve_with_incoming_shutdown(incoming, async {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await
-                    .expect("run in-memory CAS");
-            });
-            let _ = done_tx.send(());
-        });
-
-        Self {
-            endpoint,
-            service,
-            shutdown: Some(shutdown_tx),
-            done: done_rx,
-            thread: Some(thread),
-        }
-    }
-
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    pub fn token(&self) -> &str {
-        self.service.token()
-    }
-
-    pub fn insert_blob(&self, data: impl Into<Vec<u8>>) -> Digest {
-        self.service.insert_blob(data)
-    }
-
-    pub fn insert_directory(&self, directory: &Directory) -> Digest {
-        self.service.insert_directory(directory)
-    }
 }
 
 impl MemoryCasService {
     pub fn new(instance_name: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             blobs: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "test-utils")]
             writes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "test-utils")]
             reads: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "test-utils")]
             rejected_batch_writes: Arc::new(RwLock::new(HashSet::new())),
             instance_name: instance_name.into(),
             token: token.into(),
@@ -194,40 +134,35 @@ impl MemoryCasService {
             Err(Status::invalid_argument("invalid instance name"))
         }
     }
-}
 
-impl TestCasServer {
-    pub fn blob(&self, hash: &str) -> Option<Vec<u8>> {
-        self.service.blobs.read().unwrap().get(hash).cloned()
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn test_blob(&self, hash: &str) -> Option<Vec<u8>> {
+        self.blobs.read().unwrap().get(hash).cloned()
     }
 
-    pub fn write_count(&self, hash: &str) -> usize {
-        *self.service.writes.lock().unwrap().get(hash).unwrap_or(&0)
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn test_write_count(&self, hash: &str) -> usize {
+        *self.writes.lock().unwrap().get(hash).unwrap_or(&0)
     }
 
-    pub fn read_count(&self, hash: &str) -> usize {
-        *self.service.reads.lock().unwrap().get(hash).unwrap_or(&0)
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn test_read_count(&self, hash: &str) -> usize {
+        *self.reads.lock().unwrap().get(hash).unwrap_or(&0)
     }
 
-    pub fn reject_batch_write(&self, hash: impl Into<String>) {
-        self.service
-            .rejected_batch_writes
-            .write()
-            .unwrap()
-            .insert(hash.into());
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn test_reject_batch_write(&self, hash: String) {
+        self.rejected_batch_writes.write().unwrap().insert(hash);
     }
-}
 
-impl Drop for TestCasServer {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if self.done.recv_timeout(Duration::from_secs(10)).is_ok() {
-            if let Some(thread) = self.thread.take() {
-                thread.join().expect("join in-memory CAS thread");
-            }
-        }
+    #[cfg(feature = "test-utils")]
+    fn rejects_batch_write(&self, hash: &str) -> bool {
+        self.rejected_batch_writes.read().unwrap().contains(hash)
+    }
+
+    #[cfg(not(feature = "test-utils"))]
+    fn rejects_batch_write(&self, _hash: &str) -> bool {
+        false
     }
 }
 
@@ -277,12 +212,6 @@ impl ByteStream for MemoryCasService {
             .get(&digest.hash)
             .ok_or_else(|| Status::not_found("blob not found"))?;
         validate_blob(&digest, data)?;
-        *self
-            .reads
-            .lock()
-            .unwrap()
-            .entry(digest.hash.clone())
-            .or_default() += 1;
         if request.read_offset < 0 || request.read_offset > data.len() as i64 {
             return Err(Status::out_of_range("invalid read offset"));
         }
@@ -294,6 +223,15 @@ impl ByteStream for MemoryCasService {
         } else {
             data.len().min(start + request.read_limit as usize)
         };
+        #[cfg(feature = "test-utils")]
+        {
+            *self
+                .reads
+                .lock()
+                .unwrap()
+                .entry(digest.hash.clone())
+                .or_default() += 1;
+        }
         let responses = data[start..end]
             .chunks(8192)
             .map(|chunk| {
@@ -348,7 +286,10 @@ impl ByteStream for MemoryCasService {
             .write()
             .unwrap()
             .insert(digest.hash.clone(), data);
-        *self.writes.lock().unwrap().entry(digest.hash).or_default() += 1;
+        #[cfg(feature = "test-utils")]
+        {
+            *self.writes.lock().unwrap().entry(digest.hash).or_default() += 1;
+        }
         Ok(Response::new(WriteResponse {
             committed_size: digest.size_bytes,
         }))
@@ -400,13 +341,7 @@ impl ContentAddressableStorage for MemoryCasService {
             let digest = update.digest;
             let result = match digest.as_ref() {
                 None => Err(Status::invalid_argument("missing digest")),
-                Some(digest)
-                    if self
-                        .rejected_batch_writes
-                        .read()
-                        .unwrap()
-                        .contains(&digest.hash) =>
-                {
+                Some(digest) if self.rejects_batch_write(&digest.hash) => {
                     Err(Status::internal("injected batch upload failure"))
                 }
                 Some(digest) => validate_blob(digest, &update.data),
@@ -418,12 +353,15 @@ impl ContentAddressableStorage for MemoryCasService {
                     .write()
                     .unwrap()
                     .insert(digest.hash.clone(), update.data);
-                *self
-                    .writes
-                    .lock()
-                    .unwrap()
-                    .entry(digest.hash.clone())
-                    .or_default() += 1;
+                #[cfg(feature = "test-utils")]
+                {
+                    *self
+                        .writes
+                        .lock()
+                        .unwrap()
+                        .entry(digest.hash.clone())
+                        .or_default() += 1;
+                }
             }
             let status = match result {
                 Ok(()) => RpcStatus {

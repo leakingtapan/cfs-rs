@@ -37,4 +37,4 @@ jobs:
       - name: Test cas with cascli
         run: cargo test --locked --test cas_cli_e2e
       - name: Run cfs end-to-end tests
-        run: cargo test --locked --test e2e
+        run: cargo test --locked --features test-utils --test e2e

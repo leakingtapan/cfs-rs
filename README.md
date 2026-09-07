@@ -111,7 +111,7 @@ Run the unit and end-to-end suites:
 
 ```sh
 cargo test --lib --bins
-cargo test --test e2e
+cargo test --features test-utils --test e2e
 ```
 
 See the [testing guide](docs/testing.md) for prerequisites, coverage, CI

@@ -2,7 +2,8 @@ use bazel_remote_apis_rs::build::bazel::remote::execution::v2::{
     Digest as ReapiDigest, Directory as ReapiDirectory,
 };
 use cfs::cas::blocking::{CacheClient, Client};
-use cfs::cas::memory::{reapi, TestCasServer};
+use cfs::cas::memory::reapi;
+use cfs::cas::test_server::TestCasServer;
 use cfs::hash::sha256;
 use once_cell::sync::Lazy;
 use prost::Message;
