@@ -1,4 +1,3 @@
-use libc::ENOSYS;
 use anyhow::Result;
 use cfs::cas;
 use fuser::consts::FOPEN_KEEP_CACHE;
@@ -7,6 +6,7 @@ use fuser::{
     Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyOpen, ReplyXattr, Request,
 };
+use libc::{EINVAL, EIO, ENOSYS};
 use std::cmp;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -16,7 +16,9 @@ use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::str;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
+use tokio::runtime::Runtime;
 
 use bazel_remote_apis_rs::build::bazel::remote::execution::v2::Directory as BazelDirectory;
 
@@ -131,8 +133,12 @@ fn find_attr_by_name(d: BazelDirectory, name: &str) -> Option<InodeAttr> {
 /// Cfs stands for CAS File System or content addressable file system
 /// that based on Bazel remote CAS service
 struct Cfs {
-    cas_client: cas::blocking::CacheClient,
+    cas_client: cas::async_client::CacheClient,
+    runtime: Runtime,
+    state: Arc<Mutex<CfsState>>,
+}
 
+struct CfsState {
     /// CAS digest
     hash: String,
     size: i64,
@@ -145,56 +151,54 @@ struct Cfs {
     directories: HashMap<u64, HashMap<OsString, Inode>>,
 }
 
-impl Cfs {
-    fn new(hash: &str, size: i64) -> Result<Cfs> {
-        let cas_client = cas::blocking::CacheClient::new()?;
-
-        Ok(Cfs {
-            cas_client: cas_client,
+impl CfsState {
+    fn new(hash: &str, size: i64) -> Self {
+        Self {
             hash: hash.to_string(),
             size: size,
             inodes: HashMap::new(),
             directories: HashMap::new(),
-        })
+        }
     }
 
     fn next_inode_id(&self) -> u64 {
         self.inodes.len() as u64 + 1
     }
+}
 
-    /// get the contents of a directory as tree map
-    /// tree map is required for readdir when buf is full and readdir is called
-    /// with offset > 0. tree map guarantees the order when elements are skipped
-    fn get_directory_content(&mut self, inode: u64) -> Result<BTreeMap<String, FileKind>> {
-        let inode = self
-            .inodes
-            .get(&inode)
-            .ok_or(anyhow::Error::msg("inode not found"))?;
+impl Cfs {
+    fn new(hash: &str, size: i64) -> Result<Cfs> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let cas_client = runtime.block_on(cas::async_client::CacheClient::new())?;
 
-        let dir = self.cas_client.get_dir(&inode.attr.hash, inode.attr.size)?;
-        let mut entries = BTreeMap::new();
-        for f in dir.files {
-            entries.insert(f.name, FileKind::File);
-        }
-        for f in dir.directories {
-            entries.insert(f.name, FileKind::Directory);
-        }
-        for f in dir.symlinks {
-            entries.insert(f.name, FileKind::Symlink);
-        }
-        Ok(entries)
+        Ok(Cfs {
+            cas_client,
+            runtime,
+            state: Arc::new(Mutex::new(CfsState::new(hash, size))),
+        })
+    }
+
+    fn state(&self) -> Result<MutexGuard<'_, CfsState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::Error::msg("filesystem state lock is poisoned"))
     }
 }
 
 impl Filesystem for Cfs {
     fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> Result<(), c_int> {
-        self.inodes.insert(
+        let mut state = self.state().map_err(|_| EIO)?;
+        let hash = state.hash.clone();
+        let size = state.size;
+        state.inodes.insert(
             1,
             Inode {
                 inode: 1,
                 attr: InodeAttr {
-                    hash: self.hash.to_string(),
-                    size: self.size,
+                    hash,
+                    size,
                     kind: FileKind::Directory,
                     mode: 0o0770,
                 },
@@ -206,72 +210,105 @@ impl Filesystem for Cfs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup: parent {} name {:?}", parent, name);
 
-        if let Some(entries) = self.directories.get(&parent) {
-            if let Some(inode) = entries.get(&name.to_os_string()) {
-                reply.entry(&Duration::new(60, 0), &inode.clone().into(), 0);
-                return;
+        let parent_inode = {
+            let state = match self.state() {
+                Ok(state) => state,
+                Err(_) => {
+                    reply.error(EIO);
+                    return;
+                }
+            };
+            if let Some(entries) = state.directories.get(&parent) {
+                if let Some(inode) = entries.get(&name.to_os_string()) {
+                    reply.entry(&Duration::new(60, 0), &inode.clone().into(), 0);
+                    return;
+                }
             }
-        }
-        let inode = match self.inodes.get(&parent) {
-            Some(inode) => inode,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
+
+            match state.inodes.get(&parent) {
+                Some(inode) => inode.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
             }
         };
 
-        let dir = match self.cas_client.get_dir(&inode.attr.hash, inode.attr.size) {
-            Ok(dir) => dir,
-            Err(_) => {
-                reply.error(libc::ENOSYS);
-                return;
-            }
-        };
-
-        let next_inode_id = self.next_inode_id();
-        // TODOs: fix directory node properties
         let name_str = match name.to_str() {
-            Some(name) => name,
+            Some(name) => name.to_string(),
             None => {
-                //TODO: better error code
-                reply.error(libc::ENOSYS);
+                reply.error(EINVAL);
                 return;
             }
         };
-        let node_attr = match find_attr_by_name(dir, name_str) {
-            Some(attr) => attr,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-        let inode = Inode {
-            inode: next_inode_id,
-            attr: node_attr,
-        };
-        reply.entry(&Duration::new(60, 0), &inode.clone().into(), 0);
-        self.inodes.insert(next_inode_id as u64, inode.clone());
-        match self.directories.get_mut(&parent) {
-            Some(entries) => {
-                entries.insert(name.to_os_string(), inode);
-            }
-            None => {
-                let mut entries = HashMap::new();
-                entries.insert(name.to_os_string(), inode);
-                self.directories.insert(parent, entries);
-            }
-        };
+        let cas_client = self.cas_client.clone();
+        let state = self.state.clone();
+        let name = name.to_os_string();
+        self.runtime.spawn(async move {
+            let dir = match cas_client
+                .get_dir(&parent_inode.attr.hash, parent_inode.attr.size)
+                .await
+            {
+                Ok(dir) => dir,
+                Err(_) => {
+                    reply.error(EIO);
+                    return;
+                }
+            };
+            let node_attr = match find_attr_by_name(dir, &name_str) {
+                Some(attr) => attr,
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
+            let inode = {
+                let mut state = match state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        reply.error(EIO);
+                        return;
+                    }
+                };
+                if let Some(inode) = state
+                    .directories
+                    .get(&parent)
+                    .and_then(|entries| entries.get(&name))
+                {
+                    inode.clone()
+                } else {
+                    let inode = Inode {
+                        inode: state.next_inode_id(),
+                        attr: node_attr,
+                    };
+                    state.inodes.insert(inode.inode, inode.clone());
+                    state
+                        .directories
+                        .entry(parent)
+                        .or_insert_with(HashMap::new)
+                        .insert(name, inode.clone());
+                    inode
+                }
+            };
+            reply.entry(&Duration::new(60, 0), &inode.into(), 0);
+        });
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         println!("getattr(ino={})", ino);
-        match self.inodes.get(&ino) {
+        let state = match self.state() {
+            Ok(state) => state,
+            Err(_) => {
+                reply.error(EIO);
+                return;
+            }
+        };
+        match state.inodes.get(&ino) {
             Some(inode) => {
                 reply.attr(&Duration::new(60, 0), &inode.clone().into());
             }
             None => {
                 reply.error(libc::ENOENT);
-                return;
             }
         }
     }
@@ -297,32 +334,59 @@ impl Filesystem for Cfs {
         mut reply: ReplyDirectory,
     ) {
         println!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
-        assert!(offset >= 0);
-
-        let entries = match self.get_directory_content(ino) {
-            Ok(entries) => entries,
-            Err(_) => {
-                reply.error(libc::ENOSYS);
-                return;
+        if offset < 0 {
+            reply.error(EINVAL);
+            return;
+        }
+        let inode = {
+            let state = match self.state() {
+                Ok(state) => state,
+                Err(_) => {
+                    reply.error(EIO);
+                    return;
+                }
+            };
+            match state.inodes.get(&ino) {
+                Some(inode) => inode.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
             }
         };
-
-        for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
-            let (name, file_type) = entry;
-
-            let buffer_full: bool = reply.add(
-                ino,
-                offset + index as i64 + 1,
-                (*file_type).into(),
-                OsStr::from_bytes(name.as_bytes()),
-            );
-
-            if buffer_full {
-                break;
+        let cas_client = self.cas_client.clone();
+        self.runtime.spawn(async move {
+            let dir = match cas_client.get_dir(&inode.attr.hash, inode.attr.size).await {
+                Ok(dir) => dir,
+                Err(_) => {
+                    reply.error(EIO);
+                    return;
+                }
+            };
+            let mut entries = BTreeMap::new();
+            for file in dir.files {
+                entries.insert(file.name, FileKind::File);
             }
-        }
+            for directory in dir.directories {
+                entries.insert(directory.name, FileKind::Directory);
+            }
+            for symlink in dir.symlinks {
+                entries.insert(symlink.name, FileKind::Symlink);
+            }
 
-        reply.ok();
+            for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
+                let (name, file_type) = entry;
+                if reply.add(
+                    ino,
+                    offset + index as i64 + 1,
+                    (*file_type).into(),
+                    OsStr::from_bytes(name.as_bytes()),
+                ) {
+                    break;
+                }
+            }
+            reply.ok();
+        });
     }
 
     fn read(
@@ -340,24 +404,46 @@ impl Filesystem for Cfs {
             "read (inode = {}, fh = {}, offset = {}, size = {})",
             inode, fh, offset, size
         );
-        let inode = match self.inodes.get(&inode) {
-            Some(inode) => inode,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
+        if offset < 0 {
+            reply.error(EINVAL);
+            return;
+        }
+        let inode = {
+            let state = match self.state() {
+                Ok(state) => state,
+                Err(_) => {
+                    reply.error(EIO);
+                    return;
+                }
+            };
+            match state.inodes.get(&inode) {
+                Some(inode) => inode.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
             }
         };
-
-        let blob = match self.cas_client.read_blob(&inode.attr.hash, inode.attr.size) {
-            Ok(blob) => blob,
-            Err(_) => {
-                reply.error(libc::ENOSYS);
+        let cas_client = self.cas_client.clone();
+        self.runtime.spawn(async move {
+            let blob = match cas_client
+                .read_blob(&inode.attr.hash, inode.attr.size)
+                .await
+            {
+                Ok(blob) => blob,
+                Err(_) => {
+                    reply.error(EIO);
+                    return;
+                }
+            };
+            let start = offset as usize;
+            if start >= blob.len() {
+                reply.data(&[]);
                 return;
             }
-        };
-
-        let end: usize = cmp::min(inode.attr.size as usize, offset as usize + size as usize);
-        reply.data(&blob[offset as usize..end]);
+            let end = cmp::min(blob.len(), start.saturating_add(size as usize));
+            reply.data(&blob[start..end]);
+        });
     }
 
     fn getxattr(

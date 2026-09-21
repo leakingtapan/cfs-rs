@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 type CasClient = ContentAddressableStorageClient<InterceptedService<Channel, AuthInterceptor>>;
 
-type BsClient = ByteStreamClient<InterceptedService<Channel, AuthInterceptor>>;
+pub(crate) type BsClient = ByteStreamClient<InterceptedService<Channel, AuthInterceptor>>;
 
 pub struct Client {
     inner: CasClient,
